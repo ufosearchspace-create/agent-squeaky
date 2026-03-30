@@ -16,10 +16,6 @@ DGCLAW_API_KEY = _require("DGCLAW_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-HYPERLIQUID_API_URL = os.environ.get(
-    "HYPERLIQUID_API_URL", "https://api.hyperliquid.xyz/info"
-)
-
 # Table names (prefixed to avoid collision in shared Supabase)
 TABLE_AGENTS = "scanner_agents"
 TABLE_TRADES = "scanner_trades"

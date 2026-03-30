@@ -1,5 +1,5 @@
 """
-Collector: fetches DegenClaw leaderboard, Hyperliquid trades, and forum posts.
+Collector: fetches DegenClaw leaderboard and trades via DegenClaw API.
 Runs every 1 hour via APScheduler.
 """
 
@@ -11,7 +11,6 @@ import httpx
 
 from config import (
     DGCLAW_API_KEY,
-    HYPERLIQUID_API_URL,
     TABLE_AGENTS,
     TABLE_FORUM_POSTS,
     TABLE_TRADES,
@@ -21,7 +20,7 @@ from db import get_client
 logger = logging.getLogger(__name__)
 
 DGCLAW_BASE = "https://degen.virtuals.io/api"
-HL_THROTTLE_SEC = 1.0
+REQUEST_DELAY = 0.5  # polite delay between API calls
 
 
 def _dgclaw_headers() -> dict:
@@ -39,16 +38,11 @@ def fetch_leaderboard() -> list[dict]:
         resp = httpx.get(url, headers=_dgclaw_headers(), params={"limit": 1000}, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        logger.info("Leaderboard raw response keys: %s", list(data.keys()) if isinstance(data, dict) else f"list[{len(data)}]")
-        # Response could be a list or a dict with a data key — handle both
+        if isinstance(data, dict) and "data" in data:
+            return data["data"]
         if isinstance(data, list):
             return data
-        if isinstance(data, dict):
-            # Try common wrapper keys
-            for key in ("data", "agents", "results", "leaderboard"):
-                if key in data and isinstance(data[key], list):
-                    return data[key]
-            logger.warning("Unexpected leaderboard dict keys: %s — returning empty", list(data.keys()))
+        logger.warning("Unexpected leaderboard format: %s", type(data))
         return []
     except Exception:
         logger.exception("Failed to fetch leaderboard")
@@ -60,26 +54,28 @@ def upsert_agents(agents: list[dict]) -> int:
     sb = get_client()
     count = 0
     for a in agents:
-        agent_id = str(a.get("id", a.get("agentId", a.get("_id", ""))))
+        agent_id = str(a.get("id", ""))
         if not agent_id:
-            logger.warning("Agent missing id: %s", a)
             continue
+
+        perf = a.get("performance") or {}
+        acp = a.get("acpAgent") or {}
+        owner = a.get("owner") or {}
 
         row = {
             "id": agent_id,
-            "name": a.get("name", a.get("agentName", "unknown")),
-            "wallet_address": a.get("walletAddress", a.get("wallet_address")),
-            "agent_address": a.get("agentAddress", a.get("agent_address")),
-            "token_address": a.get("tokenAddress", a.get("token_address")),
-            "owner_wallet": a.get("ownerWalletAddress", a.get("owner", {}).get("walletAddress") if isinstance(a.get("owner"), dict) else None),
+            "name": str(a.get("name", "unknown"))[:255],
+            "wallet_address": acp.get("walletAddress"),
+            "agent_address": a.get("agentAddress"),
+            "token_address": a.get("tokenAddress"),
+            "owner_wallet": owner.get("walletAddress") if isinstance(owner, dict) else None,
             "last_updated": datetime.now(timezone.utc).isoformat(),
-            "trade_count": a.get("tradeCount", a.get("trade_count", 0)),
-            "win_count": a.get("winCount", a.get("win_count", 0)),
-            "loss_count": a.get("lossCount", a.get("loss_count", 0)),
-            "total_pnl": float(a.get("pnl", a.get("totalPnl", a.get("total_pnl", 0))) or 0),
-            "win_rate": float(a.get("winRate", a.get("win_rate", 0)) or 0),
+            "trade_count": perf.get("totalTradeCount", 0),
+            "win_count": perf.get("winCount", 0),
+            "loss_count": perf.get("lossCount", 0),
+            "total_pnl": float(perf.get("totalRealizedPnl", 0) or 0),
+            "win_rate": float(perf.get("winRate", 0) or 0),
         }
-        # Remove None values to let DB defaults work
         row = {k: v for k, v in row.items() if v is not None}
 
         try:
@@ -91,75 +87,69 @@ def upsert_agents(agents: list[dict]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Hyperliquid trades
+# Step 2: Trades via DegenClaw API
 # ---------------------------------------------------------------------------
 
-def _resolve_hl_wallet(agent: dict) -> str | None:
-    """Try multiple wallet fields to find one with Hyperliquid fills."""
-    candidates = [
-        agent.get("hl_wallet"),
-        agent.get("wallet_address"),
-        agent.get("agent_address"),
-        agent.get("owner_wallet"),
-    ]
-    for wallet in candidates:
-        if not wallet:
-            continue
-        fills = _fetch_hl_fills(wallet, limit=1)
-        if fills:
-            logger.info("Agent %s: HL wallet resolved to %s (from candidate)", agent["id"], wallet)
-            return wallet
-        time.sleep(HL_THROTTLE_SEC)
-    logger.warning("Agent %s: no HL wallet found among candidates %s", agent["id"], [c for c in candidates if c])
-    return None
-
-
-def _fetch_hl_fills(wallet: str, limit: int | None = None) -> list[dict]:
-    """Fetch user fills from Hyperliquid."""
-    payload = {"type": "userFills", "user": wallet}
-    try:
-        resp = httpx.post(HYPERLIQUID_API_URL, json=payload, timeout=30)
-        resp.raise_for_status()
-        fills = resp.json()
-        if not isinstance(fills, list):
-            logger.warning("HL fills unexpected format for %s: %s", wallet, type(fills))
-            return []
-        if limit:
-            return fills[:limit]
-        return fills
-    except Exception:
-        logger.exception("Failed to fetch HL fills for %s", wallet)
-        return []
-
-
-def collect_trades_for_agent(agent: dict) -> int:
-    """Fetch and store Hyperliquid trades for one agent. Returns new trade count."""
+def collect_trades_for_agent(agent_id: str) -> int:
+    """Fetch trades from DegenClaw API for one agent. Returns new trade count."""
     sb = get_client()
+    headers = _dgclaw_headers()
 
-    # Resolve HL wallet if not yet known
-    wallet = agent.get("hl_wallet")
-    if not wallet:
-        wallet = _resolve_hl_wallet(agent)
-        if wallet:
-            sb.table(TABLE_AGENTS).update({"hl_wallet": wallet}).eq("id", agent["id"]).execute()
-        else:
-            return 0
+    all_trades = []
+    offset = 0
+    limit = 100
 
-    fills = _fetch_hl_fills(wallet)
-    if not fills:
+    # Paginate through all trades
+    while True:
+        try:
+            resp = httpx.get(
+                f"{DGCLAW_BASE}/agents/{agent_id}/trades",
+                headers=headers,
+                params={"limit": limit, "offset": offset},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logger.exception("Failed to fetch trades for agent %s (offset %d)", agent_id, offset)
+            break
+
+        trades = data.get("data", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+        if not trades:
+            break
+        all_trades.extend(trades)
+
+        pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
+        if not pagination.get("hasMore", False):
+            break
+        offset += limit
+        time.sleep(REQUEST_DELAY)
+
+    if not all_trades:
         return 0
 
     inserted = 0
-    for f in fills:
+    for t in all_trades:
+        executed_at = t.get("executedAt", t.get("createdAt", ""))
+        try:
+            ts_ms = int(datetime.fromisoformat(executed_at.replace("Z", "+00:00")).timestamp() * 1000)
+        except Exception:
+            ts_ms = 0
+
+        trade_type = t.get("tradeType", "")
+        direction = t.get("direction", "")
+        # Derive side: OPEN = entry, CLOSE = exit
+        side = "B" if "OPEN" in trade_type else "S"
+
         row = {
-            "agent_id": agent["id"],
-            "timestamp_ms": int(f.get("time", 0)),
-            "coin": f.get("coin", ""),
-            "side": f.get("side", ""),
-            "direction": f.get("dir"),
-            "price": float(f.get("px", 0)),
-            "size": str(f.get("sz", "0")),
-            "closed_pnl": float(f.get("closedPnl", 0)),
+            "agent_id": agent_id,
+            "timestamp_ms": ts_ms,
+            "coin": t.get("token", ""),
+            "side": side,
+            "direction": f"{trade_type} {direction}".strip(),
+            "price": float(t.get("entryPrice") or t.get("exitPrice") or 0),
+            "size": str(t.get("positionSize", "0")),
+            "closed_pnl": float(t.get("realizedPnl", 0) or 0),
         }
         try:
             sb.table(TABLE_TRADES).upsert(
@@ -167,7 +157,7 @@ def collect_trades_for_agent(agent: dict) -> int:
             ).execute()
             inserted += 1
         except Exception:
-            logger.exception("Failed to insert trade for agent %s", agent["id"])
+            logger.exception("Failed to insert trade for agent %s", agent_id)
     return inserted
 
 
@@ -180,7 +170,6 @@ def collect_forum_posts_for_agent(agent_id: str) -> int:
     sb = get_client()
     headers = _dgclaw_headers()
 
-    # Get forums/threads for agent
     try:
         resp = httpx.get(f"{DGCLAW_BASE}/forums/{agent_id}", headers=headers, timeout=30)
         resp.raise_for_status()
@@ -189,7 +178,6 @@ def collect_forum_posts_for_agent(agent_id: str) -> int:
         logger.exception("Failed to fetch forums for agent %s", agent_id)
         return 0
 
-    # Extract thread IDs — response structure unknown, log and adapt
     threads = []
     if isinstance(forums_data, list):
         threads = forums_data
@@ -198,8 +186,6 @@ def collect_forum_posts_for_agent(agent_id: str) -> int:
             if key in forums_data and isinstance(forums_data[key], list):
                 threads = forums_data[key]
                 break
-        if not threads:
-            logger.info("Forum response for %s keys: %s", agent_id, list(forums_data.keys()))
 
     inserted = 0
     for thread in threads:
@@ -263,16 +249,17 @@ def run():
     sb = get_client()
     db_agents = sb.table(TABLE_AGENTS).select("*").execute().data or []
 
-    # Step 2: Trades
+    # Step 2: Trades via DegenClaw API
     total_trades = 0
     for agent in db_agents:
         try:
-            n = collect_trades_for_agent(agent)
+            n = collect_trades_for_agent(agent["id"])
             total_trades += n
-            logger.info("Agent %s (%s): %d trades collected", agent["id"], agent["name"], n)
+            if n > 0:
+                logger.info("Agent %s (%s): %d trades collected", agent["id"], agent["name"], n)
         except Exception:
             logger.exception("Trade collection failed for agent %s", agent["id"])
-        time.sleep(HL_THROTTLE_SEC)
+        time.sleep(REQUEST_DELAY)
 
     # Step 3: Forum posts
     total_posts = 0
