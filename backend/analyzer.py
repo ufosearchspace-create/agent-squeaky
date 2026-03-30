@@ -39,18 +39,11 @@ def score_d1_timing(trades: list[dict]) -> tuple[float, list[str]]:
     score = min(max((cv - 0.3) / 1.2, 0.0), 1.0)
     flags.append(f"timing_cv={cv:.3f}")
 
-    # Trade frequency: trades per day — high frequency = bot signal
+    # Log trade frequency for reference (not penalized — humans can also trade frequently)
     time_span_days = (timestamps[-1] - timestamps[0]) / (1000 * 86400)
     if time_span_days > 0:
         trades_per_day = len(trades) / time_span_days
         flags.append(f"trades_per_day={trades_per_day:.1f}")
-        # > 20 trades/day is very likely automated
-        if trades_per_day > 20:
-            score = max(score - 0.4, 0.0)
-            flags.append("high_frequency_bot")
-        elif trades_per_day > 10:
-            score = max(score - 0.2, 0.0)
-            flags.append("moderate_frequency")
 
     # Millisecond distribution check
     ms_parts = [t["timestamp_ms"] % 1000 for t in trades]
