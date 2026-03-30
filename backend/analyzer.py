@@ -39,6 +39,19 @@ def score_d1_timing(trades: list[dict]) -> tuple[float, list[str]]:
     score = min(max((cv - 0.3) / 1.2, 0.0), 1.0)
     flags.append(f"timing_cv={cv:.3f}")
 
+    # Trade frequency: trades per day — high frequency = bot signal
+    time_span_days = (timestamps[-1] - timestamps[0]) / (1000 * 86400)
+    if time_span_days > 0:
+        trades_per_day = len(trades) / time_span_days
+        flags.append(f"trades_per_day={trades_per_day:.1f}")
+        # > 20 trades/day is very likely automated
+        if trades_per_day > 20:
+            score = max(score - 0.4, 0.0)
+            flags.append("high_frequency_bot")
+        elif trades_per_day > 10:
+            score = max(score - 0.2, 0.0)
+            flags.append("moderate_frequency")
+
     # Millisecond distribution check
     ms_parts = [t["timestamp_ms"] % 1000 for t in trades]
     zero_ms_pct = sum(1 for m in ms_parts if m == 0) / len(ms_parts)
@@ -131,8 +144,23 @@ def score_d4_reaction(trades: list[dict]) -> tuple[float, list[str]]:
     Price reaction analysis. This is complex and requires candle data.
     For now: set neutral and flag for future improvement.
     """
-    # TODO: implement when candle data collection is added
-    return 0.5, ["d4_neutral_pending_candle_data"]
+    # No candle data yet — use trade frequency as proxy
+    # Agents that trade very frequently in reaction-like patterns = bot
+    if not trades:
+        return 0.4, ["d4_no_data"]
+
+    timestamps = sorted(t["timestamp_ms"] for t in trades)
+    # Count rapid-fire trades (< 2 min apart)
+    rapid = sum(1 for i in range(len(timestamps) - 1) if timestamps[i + 1] - timestamps[i] < 120000)
+    rapid_pct = rapid / max(len(timestamps) - 1, 1)
+
+    # High rapid-fire % = bot (automated reactions)
+    if rapid_pct > 0.5:
+        return round(0.2, 4), [f"rapid_fire_pct={rapid_pct:.2f}"]
+    elif rapid_pct > 0.3:
+        return round(0.35, 4), [f"rapid_fire_pct={rapid_pct:.2f}"]
+    else:
+        return round(0.6, 4), [f"rapid_fire_pct={rapid_pct:.2f}"]
 
 
 # ---------------------------------------------------------------------------
@@ -201,10 +229,10 @@ def score_d6_wallet(agent: dict, trades: list[dict]) -> tuple[float, list[str]]:
 # ---------------------------------------------------------------------------
 
 WEIGHTS = {
-    "d1": 0.30,
-    "d2": 0.25,
-    "d3": 0.15,
-    "d4": 0.15,
+    "d1": 0.20,
+    "d2": 0.35,
+    "d3": 0.20,
+    "d4": 0.10,
     "d5": 0.10,
     "d6": 0.05,
 }
