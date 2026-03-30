@@ -16,7 +16,7 @@ from db import get_client
 
 logger = logging.getLogger(__name__)
 
-MIN_TRADES = 10
+MIN_TRADES = 3
 
 
 # ---------------------------------------------------------------------------
