@@ -279,6 +279,14 @@ def score_agent(agent: dict) -> dict | None:
 
     all_flags = f1 + f2 + f3 + f4 + f5 + f6
 
+    # Hard override: if both sleep (24/7) AND sizing (non-round) scream bot,
+    # no other dimension can save it — humans must sleep and tend to round
+    classification = classify(composite)
+    if d2 <= 0.1 and d3 <= 0.1:
+        classification = "BOT"
+        composite = min(composite, 0.20)
+        all_flags.append("override_d2d3_bot")
+
     row = {
         "agent_id": agent["id"],
         "scored_at": datetime.now(timezone.utc).isoformat(),
@@ -289,7 +297,7 @@ def score_agent(agent: dict) -> dict | None:
         "d5_forum": d5,
         "d6_wallet": d6,
         "composite": composite,
-        "classification": classify(composite),
+        "classification": classification,
         "flags": all_flags,
         "trade_count_at_scoring": len(trades),
     }
