@@ -234,26 +234,82 @@ def score_d4_pattern(trades: list[dict]) -> tuple[float, list[str]]:
 
 
 # ---------------------------------------------------------------------------
-# D5: Forum post analysis
+# D5: PnL consistency
 # ---------------------------------------------------------------------------
 
-def score_d5_forum(agent_id: str) -> tuple[float, list[str]]:
-    sb = get_client()
-    posts = sb.table(TABLE_FORUM_POSTS).select("*").eq("agent_id", agent_id).execute().data or []
+def score_d5_pnl(trades: list[dict]) -> tuple[float, list[str]]:
+    """
+    Analyze PnL patterns. Bots have consistent, formulaic PnL distributions.
+    Humans have emotional patterns — hold losers too long, cut winners too early.
+    """
+    flags = []
+    pnls = [t.get("closed_pnl", 0) for t in trades if t.get("closed_pnl", 0) != 0]
 
-    if len(posts) < 3:
-        return None, ["no_forum_data"]  # None = exclude from weighting
+    if len(pnls) < 5:
+        return None, ["insufficient_pnl_data"]
 
-    lengths = [p["content_length"] for p in posts if p.get("content_length")]
-    if not lengths:
-        return None, ["no_content_lengths"]
+    abs_pnls = [abs(p) for p in pnls]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
 
-    mean_len = np.mean(lengths)
-    std_len = np.std(lengths)
-    cv = std_len / mean_len if mean_len > 0 else 0
+    # 1. PnL magnitude CV — bots have consistent PnL sizes, humans vary wildly
+    mean_abs = np.mean(abs_pnls)
+    if mean_abs > 0:
+        pnl_cv = np.std(abs_pnls) / mean_abs
+    else:
+        pnl_cv = 0
+    flags.append(f"pnl_cv={pnl_cv:.2f}")
 
-    score = min(max((cv - 0.1) / 0.4, 0.0), 1.0)
-    return round(score, 4), [f"forum_cv={cv:.3f}"]
+    # 2. Win/Loss asymmetry — humans cut winners short and hold losers
+    # (avg loss > avg win = human tendency, avg loss ≈ avg win = bot)
+    if wins and losses:
+        avg_win = np.mean(wins)
+        avg_loss = abs(np.mean(losses))
+        if avg_win > 0:
+            wl_ratio = avg_loss / avg_win
+            flags.append(f"wl_ratio={wl_ratio:.2f}")
+        else:
+            wl_ratio = 1.0
+    else:
+        wl_ratio = 1.0
+
+    # 3. PnL clustering — bots produce PnL in tight bands
+    if len(abs_pnls) >= 5:
+        median_pnl = np.median(abs_pnls)
+        if median_pnl > 0:
+            in_band = sum(1 for p in abs_pnls if 0.3 * median_pnl <= p <= 3.0 * median_pnl)
+            band_pct = in_band / len(abs_pnls)
+            flags.append(f"pnl_band={band_pct:.2f}")
+        else:
+            band_pct = 0.5
+    else:
+        band_pct = 0.5
+
+    # Scoring
+    score = 0.5
+
+    # Low CV = consistent = bot-like
+    if pnl_cv < 0.5:
+        score -= 0.2
+        flags.append("consistent_pnl")
+    elif pnl_cv > 2.0:
+        score += 0.2
+        flags.append("variable_pnl")
+
+    # Win/Loss asymmetry — ratio far from 1.0 = human emotional bias
+    if wl_ratio > 1.5 or wl_ratio < 0.5:
+        score += 0.15
+        flags.append("asymmetric_wl")
+    elif 0.8 <= wl_ratio <= 1.2:
+        score -= 0.1
+        flags.append("symmetric_wl")
+
+    # Tight PnL band = bot
+    if band_pct > 0.85:
+        score -= 0.15
+        flags.append("tight_pnl_band")
+
+    return round(min(max(score, 0.0), 1.0), 4), flags
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +343,11 @@ def score_d6_wallet(agent: dict, trades: list[dict]) -> tuple[float, list[str]]:
 # ---------------------------------------------------------------------------
 
 BASE_WEIGHTS = {
-    "d1": 0.20,
-    "d2": 0.35,
+    "d1": 0.15,
+    "d2": 0.30,
     "d3": 0.25,
     "d4": 0.10,
-    "d5": 0.05,
+    "d5": 0.15,
     "d6": 0.05,
 }
 
@@ -329,7 +385,7 @@ def score_agent(agent: dict) -> dict | None:
     d2, f2 = score_d2_sleep(trades)
     d3, f3 = score_d3_sizing(trades)
     d4, f4 = score_d4_pattern(trades)
-    d5, f5 = score_d5_forum(agent["id"])
+    d5, f5 = score_d5_pnl(trades)
     d6, f6 = score_d6_wallet(agent, trades)
 
     # Dynamic weighting: exclude D5/D6 when they have no data (return None)
