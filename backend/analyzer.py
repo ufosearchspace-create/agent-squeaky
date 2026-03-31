@@ -1,6 +1,6 @@
 """
 Analyzer: scores each agent on 6 dimensions (D1-D6) to classify as bot or human.
-Runs every 6 hours via APScheduler.
+Runs every 30 minutes via APScheduler.
 """
 
 import logging
@@ -20,7 +20,7 @@ MIN_TRADES = 3
 
 
 # ---------------------------------------------------------------------------
-# D1: Timing regularity (weight 0.30)
+# D1: Timing regularity
 # ---------------------------------------------------------------------------
 
 def score_d1_timing(trades: list[dict]) -> tuple[float, list[str]]:
@@ -39,30 +39,40 @@ def score_d1_timing(trades: list[dict]) -> tuple[float, list[str]]:
     score = min(max((cv - 0.3) / 1.2, 0.0), 1.0)
     flags.append(f"timing_cv={cv:.3f}")
 
-    # Log trade frequency for reference (not penalized — humans can also trade frequently)
+    # Trades per day for reference
     time_span_days = (timestamps[-1] - timestamps[0]) / (1000 * 86400)
     if time_span_days > 0:
-        trades_per_day = len(trades) / time_span_days
-        flags.append(f"trades_per_day={trades_per_day:.1f}")
+        flags.append(f"trades_per_day={len(trades) / time_span_days:.1f}")
 
-    # Millisecond distribution check
+    # Millisecond distribution — bots often trade on exact seconds
     ms_parts = [t["timestamp_ms"] % 1000 for t in trades]
     zero_ms_pct = sum(1 for m in ms_parts if m == 0) / len(ms_parts)
     if zero_ms_pct > 0.8:
         score = max(score - 0.2, 0.0)
         flags.append(f"ms_zero_pct={zero_ms_pct:.2f}")
 
+    # Interval clustering: if most intervals fall in a narrow band, that's bot-like
+    if len(intervals) >= 5:
+        median_iv = np.median(intervals)
+        if median_iv > 0:
+            within_band = sum(1 for iv in intervals if 0.5 * median_iv <= iv <= 2.0 * median_iv)
+            band_pct = within_band / len(intervals)
+            if band_pct > 0.8:
+                score = max(score - 0.15, 0.0)
+                flags.append(f"interval_cluster={band_pct:.2f}")
+
     return round(score, 4), flags
 
 
 # ---------------------------------------------------------------------------
-# D2: Sleep pattern (weight 0.25)
+# D2: Sleep pattern
 # ---------------------------------------------------------------------------
 
 def score_d2_sleep(trades: list[dict]) -> tuple[float, list[str]]:
     flags = []
     hours = [datetime.fromtimestamp(t["timestamp_ms"] / 1000, tz=timezone.utc).hour for t in trades]
     hour_counts = Counter(hours)
+    active_hours = len(hour_counts)
 
     total = sum(hour_counts.values())
     probs = [count / total for count in hour_counts.values()]
@@ -70,30 +80,48 @@ def score_d2_sleep(trades: list[dict]) -> tuple[float, list[str]]:
     max_entropy = math.log2(24)
     normalized = entropy / max_entropy
 
-    # entropy > 0.85 = bot (0), entropy < 0.5 = human (1)
-    score = min(max((0.85 - normalized) / 0.35, 0.0), 1.0)
     flags.append(f"sleep_entropy={normalized:.3f}")
+    flags.append(f"active_hours={active_hours}")
 
-    # Max consecutive hours without trades
+    # Max consecutive hours WITHOUT trades (wrap-around)
     all_hours_set = set(hours)
     max_gap = 0
     gap = 0
-    for h in range(48):  # wrap around
+    for h in range(48):
         if (h % 24) not in all_hours_set:
             gap += 1
             max_gap = max(max_gap, gap)
         else:
             gap = 0
 
-    if max_gap >= 6:
-        score = min(score + 0.15, 1.0)
-        flags.append(f"sleep_gap={max_gap}h")
+    flags.append(f"sleep_gap={max_gap}h")
+
+    # Scoring: multi-factor
+    # Primary: sleep gap is the strongest signal
+    if max_gap >= 8:
+        score = 1.0  # Clear human sleep pattern
+    elif max_gap >= 6:
+        score = 0.85
+    elif max_gap >= 4:
+        score = 0.6
+    elif max_gap >= 2:
+        # Some gap but could be bot with downtime
+        score = 0.35
+    else:
+        # Trades in nearly every hour — bot
+        score = 0.0
+
+    # Adjust by active hours coverage
+    if active_hours <= 8:
+        score = min(score + 0.1, 1.0)  # Only active in few hours = human
+    elif active_hours >= 20:
+        score = max(score - 0.1, 0.0)  # Active in almost all hours = bot
 
     return round(score, 4), flags
 
 
 # ---------------------------------------------------------------------------
-# D3: Position sizing (weight 0.15)
+# D3: Position sizing
 # ---------------------------------------------------------------------------
 
 def score_d3_sizing(trades: list[dict]) -> tuple[float, list[str]]:
@@ -112,121 +140,158 @@ def score_d3_sizing(trades: list[dict]) -> tuple[float, list[str]]:
         for divisor in [500, 250, 100, 50, 10]:
             if s != 0 and s % divisor == 0:
                 return True
+        # Also check if it's a simple number (1, 2, 5, etc.)
+        if s != 0 and s == int(s) and s <= 1000:
+            return True
         return False
 
     round_pct = sum(1 for s in sizes if is_round(s)) / len(sizes)
-    # round_pct > 0.7 = human (1), < 0.1 = bot (0)
-    score = min(max((round_pct - 0.1) / 0.6, 0.0), 1.0)
     flags.append(f"round_pct={round_pct:.2f}")
 
-    # Unique ratio
-    unique_ratio = len(set(sizes)) / len(sizes)
-    if unique_ratio < 0.3:
-        score = max(score - 0.15, 0.0)
-        flags.append(f"low_unique_ratio={unique_ratio:.2f}")
+    # Unique ratio — how many distinct sizes
+    unique_ratio = len(set(sizes)) / len(sizes) if len(sizes) > 1 else 1.0
+    flags.append(f"unique_ratio={unique_ratio:.2f}")
+
+    # Decimal precision — bots use many decimal places
+    avg_decimals = np.mean([len(str(s).split('.')[-1]) if '.' in str(s) else 0 for s in sizes])
+    flags.append(f"avg_decimals={avg_decimals:.1f}")
+
+    # Multi-factor scoring
+    if round_pct > 0.5:
+        score = 0.9  # Majority round = human
+    elif round_pct > 0.2:
+        score = 0.65  # Some round = likely human
+    elif round_pct > 0.05:
+        score = 0.4  # Very few round = uncertain
+    else:
+        # Zero round sizes
+        if avg_decimals > 4:
+            score = 0.0  # High precision + no rounding = definite bot
+            flags.append("high_precision_bot")
+        else:
+            score = 0.15  # No rounding but low precision
+
+    # Penalize very low unique ratio (same size repeated = bot formula)
+    if unique_ratio < 0.2 and len(sizes) >= 5:
+        score = max(score - 0.2, 0.0)
+        flags.append("repetitive_sizes")
 
     return round(score, 4), flags
 
 
 # ---------------------------------------------------------------------------
-# D4: Reaction to price events (weight 0.15)
+# D4: Trade pattern analysis
 # ---------------------------------------------------------------------------
 
-def score_d4_reaction(trades: list[dict]) -> tuple[float, list[str]]:
-    """
-    Price reaction analysis. This is complex and requires candle data.
-    For now: set neutral and flag for future improvement.
-    """
-    # No candle data yet — use trade frequency as proxy
-    # Agents that trade very frequently in reaction-like patterns = bot
-    if not trades:
-        return 0.4, ["d4_no_data"]
+def score_d4_pattern(trades: list[dict]) -> tuple[float, list[str]]:
+    """Analyze trade patterns: coin diversity, direction patterns, timing."""
+    flags = []
+    if len(trades) < 3:
+        return 0.5, ["d4_insufficient"]
 
     timestamps = sorted(t["timestamp_ms"] for t in trades)
-    # Count rapid-fire trades (< 2 min apart)
+
+    # Rapid-fire trades (< 2 min apart)
     rapid = sum(1 for i in range(len(timestamps) - 1) if timestamps[i + 1] - timestamps[i] < 120000)
     rapid_pct = rapid / max(len(timestamps) - 1, 1)
+    flags.append(f"rapid_fire={rapid_pct:.2f}")
 
-    # High rapid-fire % = bot (automated reactions)
-    if rapid_pct > 0.5:
-        return round(0.2, 4), [f"rapid_fire_pct={rapid_pct:.2f}"]
-    elif rapid_pct > 0.3:
-        return round(0.35, 4), [f"rapid_fire_pct={rapid_pct:.2f}"]
+    # Coin diversity — humans tend to trade fewer coins
+    coins = [t.get("coin", "") for t in trades]
+    unique_coins = len(set(coins))
+    flags.append(f"unique_coins={unique_coins}")
+
+    # Direction pattern — bots often alternate mechanically
+    directions = [t.get("side", "") for t in trades]
+    if len(directions) >= 4:
+        alternations = sum(1 for i in range(len(directions) - 1) if directions[i] != directions[i + 1])
+        alt_pct = alternations / (len(directions) - 1)
+        flags.append(f"alt_pct={alt_pct:.2f}")
     else:
-        return round(0.6, 4), [f"rapid_fire_pct={rapid_pct:.2f}"]
+        alt_pct = 0.5
+
+    # Scoring
+    score = 0.5  # start neutral
+
+    if rapid_pct > 0.5:
+        score -= 0.25  # rapid fire = bot
+    elif rapid_pct > 0.3:
+        score -= 0.1
+
+    # High coin diversity with many trades = sophisticated bot
+    if unique_coins >= 5 and len(trades) >= 10:
+        score -= 0.1
+        flags.append("multi_coin_bot")
+    elif unique_coins <= 2 and len(trades) >= 10:
+        score += 0.1  # Focused trading = could be human
+
+    # Perfect alternation = mechanical
+    if alt_pct > 0.85:
+        score -= 0.1
+        flags.append("mechanical_alternation")
+
+    return round(min(max(score, 0.0), 1.0), 4), flags
 
 
 # ---------------------------------------------------------------------------
-# D5: Forum post analysis (weight 0.10)
+# D5: Forum post analysis
 # ---------------------------------------------------------------------------
 
 def score_d5_forum(agent_id: str) -> tuple[float, list[str]]:
-    flags = []
     sb = get_client()
     posts = sb.table(TABLE_FORUM_POSTS).select("*").eq("agent_id", agent_id).execute().data or []
 
     if len(posts) < 3:
-        return 0.5, ["insufficient_forum_posts"]
+        return None, ["no_forum_data"]  # None = exclude from weighting
 
     lengths = [p["content_length"] for p in posts if p.get("content_length")]
     if not lengths:
-        return 0.5, ["no_content_lengths"]
+        return None, ["no_content_lengths"]
 
     mean_len = np.mean(lengths)
     std_len = np.std(lengths)
     cv = std_len / mean_len if mean_len > 0 else 0
 
-    # cv < 0.1 = bot template (0), > 0.5 = human variability (1)
     score = min(max((cv - 0.1) / 0.4, 0.0), 1.0)
-    flags.append(f"forum_length_cv={cv:.3f}")
-
-    return round(score, 4), flags
+    return round(score, 4), [f"forum_cv={cv:.3f}"]
 
 
 # ---------------------------------------------------------------------------
-# D6: Wallet age (weight 0.05)
+# D6: Wallet age
 # ---------------------------------------------------------------------------
 
 def score_d6_wallet(agent: dict, trades: list[dict]) -> tuple[float, list[str]]:
-    flags = []
     if not trades:
-        return 0.5, ["no_trades_for_wallet_age"]
+        return None, ["no_wallet_data"]  # None = exclude from weighting
 
     earliest_trade = min(t["timestamp_ms"] for t in trades)
     first_seen = agent.get("first_seen")
 
-    if first_seen:
-        try:
-            fs_dt = datetime.fromisoformat(first_seen.replace("Z", "+00:00"))
-            fs_ms = int(fs_dt.timestamp() * 1000)
-            # If first trade is much earlier than first_seen on platform — diverse activity
-            diff_hours = (fs_ms - earliest_trade) / (1000 * 3600)
-            if diff_hours > 168:  # > 1 week before DGClaw
-                score = 0.7
-                flags.append("wallet_pre_existing")
-            else:
-                score = 0.3
-                flags.append("wallet_new_to_dgclaw")
-        except Exception:
-            score = 0.5
-            flags.append("first_seen_parse_error")
-    else:
-        score = 0.5
-        flags.append("no_first_seen")
+    if not first_seen:
+        return None, ["no_first_seen"]
 
-    return round(score, 4), flags
+    try:
+        fs_dt = datetime.fromisoformat(first_seen.replace("Z", "+00:00"))
+        fs_ms = int(fs_dt.timestamp() * 1000)
+        diff_hours = (fs_ms - earliest_trade) / (1000 * 3600)
+        if diff_hours > 168:
+            return 0.7, ["wallet_pre_existing"]
+        else:
+            return 0.3, ["wallet_new_to_dgclaw"]
+    except Exception:
+        return None, ["first_seen_parse_error"]
 
 
 # ---------------------------------------------------------------------------
-# Composite
+# Composite — dynamic weighting
 # ---------------------------------------------------------------------------
 
-WEIGHTS = {
+BASE_WEIGHTS = {
     "d1": 0.20,
     "d2": 0.35,
-    "d3": 0.20,
+    "d3": 0.25,
     "d4": 0.10,
-    "d5": 0.10,
+    "d5": 0.05,
     "d6": 0.05,
 }
 
@@ -234,9 +299,9 @@ WEIGHTS = {
 def classify(composite: float) -> str:
     if composite < 0.25:
         return "BOT"
-    elif composite < 0.40:
+    elif composite < 0.45:
         return "LIKELY_BOT"
-    elif composite < 0.60:
+    elif composite < 0.55:
         return "UNCERTAIN"
     elif composite < 0.75:
         return "LIKELY_HUMAN"
@@ -263,29 +328,66 @@ def score_agent(agent: dict) -> dict | None:
     d1, f1 = score_d1_timing(trades)
     d2, f2 = score_d2_sleep(trades)
     d3, f3 = score_d3_sizing(trades)
-    d4, f4 = score_d4_reaction(trades)
+    d4, f4 = score_d4_pattern(trades)
     d5, f5 = score_d5_forum(agent["id"])
     d6, f6 = score_d6_wallet(agent, trades)
 
-    composite = round(
-        WEIGHTS["d1"] * d1
-        + WEIGHTS["d2"] * d2
-        + WEIGHTS["d3"] * d3
-        + WEIGHTS["d4"] * d4
-        + WEIGHTS["d5"] * d5
-        + WEIGHTS["d6"] * d6,
-        4,
-    )
+    # Dynamic weighting: exclude D5/D6 when they have no data (return None)
+    # and redistribute their weight to D1-D4
+    scores = {"d1": d1, "d2": d2, "d3": d3, "d4": d4, "d5": d5, "d6": d6}
+    active_weights = {}
+    excluded_weight = 0.0
+
+    for dim, weight in BASE_WEIGHTS.items():
+        if scores[dim] is None:
+            excluded_weight += weight
+        else:
+            active_weights[dim] = weight
+
+    # Redistribute excluded weight proportionally to active dimensions
+    if excluded_weight > 0 and active_weights:
+        total_active = sum(active_weights.values())
+        for dim in active_weights:
+            active_weights[dim] = active_weights[dim] / total_active
+
+    # Calculate composite
+    composite = 0.0
+    for dim, weight in active_weights.items():
+        composite += weight * scores[dim]
+    composite = round(composite, 4)
+
+    # Store None as 0.5 for DB (display purposes)
+    d5_display = d5 if d5 is not None else 0.5
+    d6_display = d6 if d6 is not None else 0.5
 
     all_flags = f1 + f2 + f3 + f4 + f5 + f6
 
-    # Hard override: if both sleep (24/7) AND sizing (non-round) scream bot,
-    # no other dimension can save it — humans must sleep and tend to round
+    # === OVERRIDE RULES ===
+
     classification = classify(composite)
+
+    # Override rules — change classification but keep natural composite spread
+
+    # Rule 1: D2 (sleep) AND D3 (sizing) both scream bot → BOT
     if d2 <= 0.1 and d3 <= 0.1:
         classification = "BOT"
-        composite = min(composite, 0.20)
         all_flags.append("override_d2d3_bot")
+
+    # Rule 2: D3 = 0 with high precision → strong bot signal
+    if d3 <= 0.05 and "high_precision_bot" in all_flags and classification == "UNCERTAIN":
+        classification = "LIKELY_BOT"
+        all_flags.append("override_precision_bot")
+
+    # Rule 3: Clear sleep gap (D2 >= 0.85) → not a bot
+    if d2 >= 0.85 and classification in ("UNCERTAIN", "LIKELY_BOT"):
+        classification = "LIKELY_HUMAN"
+        all_flags.append("override_clear_sleep")
+
+    # Rule 4: Active in 20+ hours AND no round sizes → bot
+    active_h = int(next((f.split("=")[1] for f in all_flags if f.startswith("active_hours=")), "0"))
+    if active_h >= 20 and d3 <= 0.15:
+        classification = "BOT"
+        all_flags.append("override_allday_noround")
 
     row = {
         "agent_id": agent["id"],
@@ -294,8 +396,8 @@ def score_agent(agent: dict) -> dict | None:
         "d2_sleep": d2,
         "d3_sizing": d3,
         "d4_reaction": d4,
-        "d5_forum": d5,
-        "d6_wallet": d6,
+        "d5_forum": d5_display,
+        "d6_wallet": d6_display,
         "composite": composite,
         "classification": classification,
         "flags": all_flags,
