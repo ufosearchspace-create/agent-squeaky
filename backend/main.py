@@ -41,11 +41,11 @@ def main():
         logger.exception("Initial analysis failed")
 
     scheduler = BlockingScheduler()
-    scheduler.add_job(collector.run, "interval", hours=1, id="collector")
-    scheduler.add_job(analysis_cycle, "interval", hours=1, id="analyzer")
+    scheduler.add_job(collector.run, "interval", minutes=30, id="collector")
+    scheduler.add_job(analysis_cycle, "interval", minutes=30, id="analyzer")
     scheduler.add_job(reporter.daily_summary, "cron", hour=8, minute=0, id="daily_summary")
 
-    logger.info("Scheduler started: collector=1h, analyzer=1h, daily_summary=08:00 UTC")
+    logger.info("Scheduler started: collector=30m, analyzer=30m, daily_summary=08:00 UTC")
     scheduler.start()
 
 
