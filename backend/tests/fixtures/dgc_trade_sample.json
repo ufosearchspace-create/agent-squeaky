@@ -1,0 +1,42 @@
+{
+  "success": true,
+  "data": [
+    {
+      "id": "32987",
+      "tradeType": "PERP_CLOSE",
+      "txHash": null,
+      "executedAt": "2026-04-08T14:36:34.897Z",
+      "openedAt": "2026-04-08T12:55:59.124Z",
+      "token": "VIRTUAL",
+      "amount": null,
+      "usdcAmount": null,
+      "direction": "SHORT",
+      "positionSize": 99.22625500000001,
+      "leverage": 5,
+      "entryPrice": 0.68577,
+      "exitPrice": 0.67358,
+      "collateral": null,
+      "realizedPnl": 0.917907,
+      "createdAt": "2026-04-08T14:40:10.041Z"
+    },
+    {
+      "id": "32954",
+      "tradeType": "PERP_CLOSE",
+      "txHash": null,
+      "executedAt": "2026-04-08T14:20:04.873Z",
+      "openedAt": "2026-04-08T10:26:11.832Z",
+      "token": "HYPE",
+      "amount": null,
+      "usdcAmount": null,
+      "direction": "SHORT",
+      "positionSize": 99.59281,
+      "leverage": 5,
+      "entryPrice": 39.393,
+      "exitPrice": 38.881,
+      "collateral": null,
+      "realizedPnl": 0.9728,
+      "createdAt": "2026-04-08T14:25:08.189Z"
+    }
+  ],
+  "pagination": {"total": 2, "limit": 100, "offset": 0, "hasMore": false}
+}

@@ -1,6 +1,6 @@
 """
 Collector: fetches DegenClaw leaderboard and trades via DegenClaw API.
-Runs every 1 hour via APScheduler.
+Runs every 30 minutes via APScheduler.
 """
 
 import logging
@@ -25,6 +25,66 @@ REQUEST_DELAY = 0.5  # polite delay between API calls
 
 def _dgclaw_headers() -> dict:
     return {"Authorization": f"Bearer {DGCLAW_API_KEY}"}
+
+
+# ---------------------------------------------------------------------------
+# Pure parsers (testable without DB or HTTP)
+# ---------------------------------------------------------------------------
+
+def _iso_to_ms(s: str | None) -> int | None:
+    """Convert an ISO-8601 timestamp (possibly with trailing Z) to epoch ms.
+
+    Returns None for None, empty string, or unparseable input. Never raises.
+    """
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def _to_float(v) -> float | None:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(v) -> int | None:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trade_to_row(agent_id: str, api_trade: dict) -> dict:
+    """Pure parser: DegenClaw /agents/{id}/trades row -> scanner_trades row.
+
+    DegenClaw API returns each CLOSE event with the full open+close pair
+    inline (openedAt, executedAt, entryPrice, exitPrice, etc.), so one API
+    row maps directly to one scanner_trades row. All fields are optional
+    except the dgc_trade_id + closed_at_ms that the caller should validate.
+    """
+    trade_id = api_trade.get("id")
+    return {
+        "agent_id": agent_id,
+        "dgc_trade_id": str(trade_id) if trade_id is not None else None,
+        "opened_at_ms": _iso_to_ms(api_trade.get("openedAt")),
+        "closed_at_ms": _iso_to_ms(api_trade.get("executedAt")),
+        "coin": api_trade.get("token") or "",
+        "direction": api_trade.get("direction") or "",
+        "entry_price": _to_float(api_trade.get("entryPrice")),
+        "exit_price": _to_float(api_trade.get("exitPrice")),
+        "position_size": _to_float(api_trade.get("positionSize")),
+        "leverage": _to_int(api_trade.get("leverage")),
+        "closed_pnl": _to_float(api_trade.get("realizedPnl")) or 0.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -130,30 +190,14 @@ def collect_trades_for_agent(agent_id: str) -> int:
 
     inserted = 0
     for t in all_trades:
-        executed_at = t.get("executedAt", t.get("createdAt", ""))
-        try:
-            ts_ms = int(datetime.fromisoformat(executed_at.replace("Z", "+00:00")).timestamp() * 1000)
-        except Exception:
-            ts_ms = 0
-
-        trade_type = t.get("tradeType", "")
-        direction = t.get("direction", "")
-        # Derive side: OPEN = entry, CLOSE = exit
-        side = "B" if "OPEN" in trade_type else "S"
-
-        row = {
-            "agent_id": agent_id,
-            "timestamp_ms": ts_ms,
-            "coin": t.get("token", ""),
-            "side": side,
-            "direction": f"{trade_type} {direction}".strip(),
-            "price": float(t.get("entryPrice") or t.get("exitPrice") or 0),
-            "size": str(t.get("positionSize", "0")),
-            "closed_pnl": float(t.get("realizedPnl", 0) or 0),
-        }
+        row = _trade_to_row(agent_id, t)
+        if not row["dgc_trade_id"] or row["closed_at_ms"] is None:
+            # Missing natural key or close timestamp — skip silently,
+            # this is a malformed API row we cannot dedup against.
+            continue
         try:
             sb.table(TABLE_TRADES).upsert(
-                row, on_conflict="agent_id,timestamp_ms,coin,side,size"
+                row, on_conflict="agent_id,dgc_trade_id"
             ).execute()
             inserted += 1
         except Exception:
