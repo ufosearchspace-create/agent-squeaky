@@ -70,6 +70,10 @@ def _trade_to_row(agent_id: str, api_trade: dict) -> dict:
     inline (openedAt, executedAt, entryPrice, exitPrice, etc.), so one API
     row maps directly to one scanner_trades row. All fields are optional
     except the dgc_trade_id + closed_at_ms that the caller should validate.
+
+    closed_pnl is stored as None (not 0.0) when the API omits realizedPnl
+    so that B3 win/loss asymmetry does not silently count missing-PnL
+    trades as "neither win nor loss" biased data.
     """
     trade_id = api_trade.get("id")
     return {
@@ -83,7 +87,7 @@ def _trade_to_row(agent_id: str, api_trade: dict) -> dict:
         "exit_price": _to_float(api_trade.get("exitPrice")),
         "position_size": _to_float(api_trade.get("positionSize")),
         "leverage": _to_int(api_trade.get("leverage")),
-        "closed_pnl": _to_float(api_trade.get("realizedPnl")) or 0.0,
+        "closed_pnl": _to_float(api_trade.get("realizedPnl")),
     }
 
 

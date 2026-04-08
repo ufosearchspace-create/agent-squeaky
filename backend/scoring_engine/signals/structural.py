@@ -134,23 +134,21 @@ def signal_s3_benford_compliance(ctx: SignalContext) -> EvidenceScore | None:
     if len(leading) < 30:
         return None
 
-    observed = [leading.count(d) / len(leading) for d in range(1, 10)]
-    # Simple chi-square against expected proportions. SciPy's chisquare is
-    # available but the manual form avoids a hard dep for edge-case input.
+    # scipy.stats.chisquare is a hard dep (in requirements.txt). If it fails
+    # on pathological input (e.g. a leading-digit bin with zero expected
+    # count), we abstain rather than returning a fake p-value — the manual
+    # math.exp(-chi/2) fallback used here previously is NOT a valid
+    # chi-square CDF inversion and would misclassify edge cases as bots.
     try:
         from scipy.stats import chisquare
 
         exp_counts = [p * len(leading) for p in _BENFORD_EXPECTED]
         obs_counts = [leading.count(d) for d in range(1, 10)]
+        if min(exp_counts) <= 0:
+            return None
         _stat, p_value = chisquare(obs_counts, f_exp=exp_counts)
     except Exception:
-        # Manual chi-square fallback if scipy hiccups on edge input.
-        chi = sum(
-            ((o - e) ** 2) / e if e > 0 else 0
-            for o, e in zip(observed, _BENFORD_EXPECTED)
-        )
-        # Rough p-value approximation — dof=8.
-        p_value = math.exp(-chi / 2)
+        return None
 
     if p_value < 0.05:
         state = "medium_bot"

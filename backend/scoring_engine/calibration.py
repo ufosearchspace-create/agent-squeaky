@@ -7,6 +7,7 @@ data update — no code deploy needed to retune.
 """
 from __future__ import annotations
 
+from config import TABLE_SIGNAL_LRS
 from db import get_client
 
 _CACHE: dict[str, dict[str, float]] = {}
@@ -24,7 +25,7 @@ def reload_cache() -> int:
     global _CACHE, _VERSION
     sb = get_client()
     rows = (
-        sb.table("scanner_signal_lrs")
+        sb.table(TABLE_SIGNAL_LRS)
         .select("*")
         .eq("active", True)
         .execute()

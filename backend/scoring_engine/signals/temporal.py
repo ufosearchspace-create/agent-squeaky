@@ -272,13 +272,9 @@ def signal_t5_dead_days(ctx: SignalContext) -> EvidenceScore | None:
     if total_span < 10:
         return None
     # Number of dates inside [first,last] with zero trades.
-    active_dates = set(dates)
-    dead = sum(
-        1
-        for i in range(total_span)
-        if (first + (last - first) * 0).replace() or True  # keep indent
-        if (first.toordinal() + i) not in {d.toordinal() for d in active_dates}
-    )
+    active_ordinals = {d.toordinal() for d in dates}
+    first_ord = first.toordinal()
+    dead = sum(1 for i in range(total_span) if (first_ord + i) not in active_ordinals)
 
     if dead >= 2:
         state = "medium_human"
@@ -387,8 +383,6 @@ def signal_t8_ms_entropy(ctx: SignalContext) -> EvidenceScore | None:
         state = "strong_bot"
     elif entropy < 3.0:
         state = "medium_bot"
-    elif entropy >= 5.0:
-        state = "neutral"
     else:
         state = "neutral"
 

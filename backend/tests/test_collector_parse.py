@@ -88,4 +88,6 @@ def test_trade_to_row_handles_missing_numeric_fields():
     assert row["leverage"] is None
     assert row["entry_price"] is None
     assert row["exit_price"] is None
-    assert row["closed_pnl"] == 0.0  # defaults to 0 to avoid NULL pnl
+    # closed_pnl is stored as None (not 0.0) so B3 can distinguish
+    # "missing PnL" from "break-even trade" and skip biased data.
+    assert row["closed_pnl"] is None
