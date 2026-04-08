@@ -56,23 +56,41 @@ def human_daily_trader(
 ) -> list[dict]:
     """Simulate a human: ~8h active window, variable sizes, weekend lighter.
 
-    Produces enough day-to-day variation so T1 (sleep gap), T4 (daily volume
-    CV), T5 (dead days), and T3 (weekend ratio) can all recognise the pattern.
+    Produces enough day-to-day variation so T1 (sleep gap), T3 (weekend
+    ratio), T4 (daily volume CV), and T5 (dead days) can all recognise the
+    pattern. Each day randomly picks a subset of active hours and varies
+    trades/hour so the CV is realistically human.
     """
     out: list[dict] = []
+    # Deterministic "mood" offsets per day — mimics human day-to-day variance
+    # without introducing real randomness (tests must stay reproducible).
+    day_moods = [
+        # (hours_subset_offset, trades_per_hour_multiplier)
+        (0, 1.0), (2, 0.5), (1, 1.5), (3, 0.7), (0, 1.2),
+        (4, 0.3), (2, 1.3), (1, 0.9), (0, 0.6), (3, 1.4),
+        (2, 0.8), (0, 1.1), (1, 0.4), (4, 1.0),
+    ]
     for d in range(days):
         day = _EPOCH + timedelta(days=d)
         is_weekend = day.weekday() >= 5
-        hourly = trades_per_active_hour
+        mood_offset, mood_mult = day_moods[d % len(day_moods)]
+        day_hours = active_hours[mood_offset:] or active_hours
+        hourly = max(1, int(round(trades_per_active_hour * mood_mult)))
         if is_weekend:
-            hourly = max(1, int(round(trades_per_active_hour * weekend_fraction)))
-        for h in active_hours:
+            hourly = max(1, int(round(hourly * weekend_fraction)))
+        for h in day_hours:
             for i in range(hourly):
-                ts = day + timedelta(hours=h, minutes=i * 15, seconds=(7 * i) % 60, milliseconds=(i * 137) % 1000)
-                # Human-like variable size and hold time: odd numbers, wide variation.
-                size = 87 + (i * 41) + (d * 13)
+                # Wide ms spread per trade so T8 entropy stays high.
+                ms_spread = (i * 571 + d * 89 + h * 257) % 1000
+                ts = day + timedelta(
+                    hours=h,
+                    minutes=i * 15 + (d * 7) % 60,
+                    seconds=(7 * i + 11 * d) % 60,
+                    milliseconds=ms_spread,
+                )
+                size = 87 + (i * 41) + (d * 13) + (h * 3)
                 hold_s = 1800 + (i * 311) + (d * 97)
-                out.append(_to_row(ts, size=float(size), hold_s=hold_s, leverage=3 + (i % 3)))
+                out.append(_to_row(ts, size=float(size), hold_s=hold_s, leverage=3 + ((i + d) % 3)))
     return out
 
 
@@ -109,15 +127,16 @@ def bot_24_7_zero_ms(days: int = 10, trades_per_hour: int = 4) -> list[dict]:
 
 
 def scalper_bot(n: int = 200, coin: str = "SOL") -> list[dict]:
-    """Fast-flipping bot: sub-minute hold times, identical sizes, one coin."""
+    """Fast-flipping bot: sub-minute hold times, tight spacing, one coin."""
     base = _EPOCH + timedelta(days=6)
+    # 45-second spacing keeps several trades inside the 5-minute T6 window.
     return [
         _to_row(
-            base + timedelta(minutes=i * 3),
+            base + timedelta(seconds=i * 45),
             coin=coin,
             size=99.3742,
             leverage=10,
-            hold_s=45,
+            hold_s=30,
         )
         for i in range(n)
     ]
