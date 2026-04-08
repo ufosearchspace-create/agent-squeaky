@@ -10,6 +10,9 @@ from __future__ import annotations
 from config import TABLE_SIGNAL_LRS
 from db import get_client
 
+# Module-level cache. Safe under the current BlockingScheduler (single
+# job thread at a time). If we ever switch to BackgroundScheduler or run
+# multiple analyzer workers, wrap _CACHE/_VERSION writes in a lock.
 _CACHE: dict[str, dict[str, float]] = {}
 _VERSION: int = 0
 

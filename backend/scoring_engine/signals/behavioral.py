@@ -126,7 +126,9 @@ def signal_b2_hold_time_median(ctx: SignalContext) -> EvidenceScore | None:
         return None
 
     median = _median([float(h) for h in holds])
-    if median < 60 or median > 86400:
+    # Boundaries are inclusive with the seed cutoffs (60s scalper, 86400s
+    # swing) — an exact 60s or 86400s median already counts as weak_bot.
+    if median <= 60 or median >= 86400:
         state = "weak_bot"
     else:
         state = "neutral"

@@ -2,6 +2,7 @@
 Collector: fetches DegenClaw leaderboard and trades via DegenClaw API.
 Runs every 30 minutes via APScheduler.
 """
+from __future__ import annotations
 
 import logging
 import time
@@ -45,20 +46,20 @@ def _iso_to_ms(s: str | None) -> int | None:
     return int(dt.timestamp() * 1000)
 
 
-def _to_float(v) -> float | None:
+def _to_float(v: object) -> float | None:
     if v is None:
         return None
     try:
-        return float(v)
+        return float(v)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
 
 
-def _to_int(v) -> int | None:
+def _to_int(v: object) -> int | None:
     if v is None:
         return None
     try:
-        return int(v)
+        return int(v)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
 
@@ -282,7 +283,7 @@ def collect_forum_posts_for_agent(agent_id: str) -> int:
 # Main run
 # ---------------------------------------------------------------------------
 
-def run():
+def run() -> None:
     """Full collection cycle."""
     logger.info("=== Collector started ===")
     start = time.time()

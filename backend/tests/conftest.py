@@ -65,7 +65,9 @@ _V1_STATES: dict[str, dict[str, float]] = {
         "weak_human": -0.5, "neutral": 0.0, "medium_bot": 1.5, "strong_bot": 3.0,
     },
     "S5_size_ladder_pattern": {
-        "neutral": 0.0, "medium_bot": 1.5, "strong_bot": 3.0,
+        # Matches migration 006b — medium_bot state removed (signal module
+        # never produces it; kept as an explicit cleanup to avoid dead LRs).
+        "neutral": 0.0, "strong_bot": 3.0,
     },
     "S6_identical_size_repetition": {
         "weak_human": -0.5, "neutral": 0.0, "medium_bot": 1.5, "strong_bot": 3.0,
