@@ -78,6 +78,10 @@ def human_daily_trader(
         hourly = max(1, int(round(trades_per_active_hour * mood_mult)))
         if is_weekend:
             hourly = max(1, int(round(hourly * weekend_fraction)))
+        # Human hold times span orders of magnitude: some quick scalps,
+        # some multi-hour swings, some held over lunch. Deterministic
+        # sequence so tests stay reproducible.
+        hold_palette = [45, 180, 720, 1800, 5400, 14400, 43200, 120]
         for h in day_hours:
             for i in range(hourly):
                 # Wide ms spread per trade so T8 entropy stays high.
@@ -89,7 +93,7 @@ def human_daily_trader(
                     milliseconds=ms_spread,
                 )
                 size = 87 + (i * 41) + (d * 13) + (h * 3)
-                hold_s = 1800 + (i * 311) + (d * 97)
+                hold_s = hold_palette[(i + d * 3 + h) % len(hold_palette)]
                 out.append(_to_row(ts, size=float(size), hold_s=hold_s, leverage=3 + ((i + d) % 3)))
     return out
 
