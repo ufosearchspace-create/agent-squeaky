@@ -1,15 +1,11 @@
-"""
-Main entry point: APScheduler runs collector, analyzer, reporter on schedule.
-"""
-
+"""Main entry point: APScheduler runs collector + analyzer on schedule."""
 import logging
 import sys
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-import collector
 import analyzer
-import reporter
+import collector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,33 +15,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def analysis_cycle():
-    """Run analyzer then reporter."""
-    analyzer.run()
-    reporter.post_analysis_report()
-
-
-def main():
+def main() -> None:
     logger.info("=== Agent Squeaky Scanner starting ===")
 
-    # Run initial collection immediately
+    # Warm start: one collection + analysis cycle before the scheduler takes over.
     try:
         collector.run()
     except Exception:
         logger.exception("Initial collection failed")
-
-    # Run initial analysis
     try:
-        analysis_cycle()
+        analyzer.run()
     except Exception:
         logger.exception("Initial analysis failed")
 
     scheduler = BlockingScheduler()
     scheduler.add_job(collector.run, "interval", minutes=30, id="collector")
-    scheduler.add_job(analysis_cycle, "interval", minutes=30, id="analyzer")
-    scheduler.add_job(reporter.daily_summary, "cron", hour=8, minute=0, id="daily_summary")
-
-    logger.info("Scheduler started: collector=30m, analyzer=30m, daily_summary=08:00 UTC")
+    scheduler.add_job(analyzer.run, "interval", minutes=30, id="analyzer")
+    logger.info("Scheduler started: collector=30m, analyzer=30m")
     scheduler.start()
 
 
