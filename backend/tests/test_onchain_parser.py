@@ -129,3 +129,59 @@ def test_parse_handles_commas_in_tx_count():
     assert row["total_tx_count"] == 1234
     assert row["balance_usd"] == 500.00
     assert row["chains_active"] == 4
+
+
+# ---------------------------------------------------------------------------
+# SSRF / injection guards on the HTTP layer
+# ---------------------------------------------------------------------------
+
+def test_fetch_rejects_malformed_owner_wallet():
+    """_fetch_basescan_html MUST refuse anything that is not a 0x-prefixed
+    40-hex-char Ethereum address, to close the SSRF / path-traversal vector
+    from DegenClaw-sourced owner_wallet fields."""
+    from unittest.mock import MagicMock
+
+    from onchain_enricher import _fetch_basescan_html
+
+    client = MagicMock()
+    # Path traversal attempt
+    html, status = _fetch_basescan_html(client, "../../../../etc/passwd")
+    assert html is None
+    assert status is None
+    client.get.assert_not_called()
+
+    # Query-string injection attempt
+    html, status = _fetch_basescan_html(
+        client, "0x0000000000000000000000000000000000000000?q=evil"
+    )
+    assert html is None
+    client.get.assert_not_called()
+
+    # Empty / None
+    assert _fetch_basescan_html(client, "") == (None, None)
+    assert _fetch_basescan_html(client, None) == (None, None)  # type: ignore[arg-type]
+    client.get.assert_not_called()
+
+    # Too short
+    assert _fetch_basescan_html(client, "0xdead") == (None, None)
+    client.get.assert_not_called()
+
+
+def test_fetch_accepts_valid_checksummed_address():
+    """A proper 0x + 40-hex address must be allowed through."""
+    from unittest.mock import MagicMock
+
+    from onchain_enricher import _fetch_basescan_html
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.text = "<html></html>"
+    client = MagicMock()
+    client.get.return_value = fake_resp
+
+    html, status = _fetch_basescan_html(
+        client, "0x5Ae31b437851B57a491603D6C7A845B61c88F1f5"
+    )
+    assert status == 200
+    assert html == "<html></html>"
+    client.get.assert_called_once()

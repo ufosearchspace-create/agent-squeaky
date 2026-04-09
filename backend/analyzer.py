@@ -142,11 +142,18 @@ def _load_all_onchain() -> dict[str, dict]:
     rows (one per distinct owner_wallet) so this is trivial compared to
     the 275 per-agent lookups the naive pattern would do. Returns
     ``{owner_wallet_lowercase: onchain_row}``.
+
+    Uses an explicit column projection + limit so an accidental table
+    growth never silently truncates via the Supabase default page cap.
     """
     sb = get_client()
     rows = (
         sb.table(TABLE_ONCHAIN)
-        .select("*")
+        .select(
+            "owner_wallet,age_days,total_tx_count,chains_active,"
+            "balance_usd,address_kind,last_refreshed_at,source"
+        )
+        .limit(5000)
         .execute()
         .data
         or []

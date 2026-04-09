@@ -29,6 +29,7 @@ import logging
 import random
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -67,20 +68,30 @@ USER_AGENTS = [
 # Regex anchors (compile once)
 # ---------------------------------------------------------------------------
 
+#: Validates a well-formed 0x Ethereum address before we inject it into
+#: the Basescan URL template. Prevents SSRF / path traversal when the
+#: DegenClaw-sourced owner_wallet is malformed or adversarial.
+_ETH_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+#: Match anchors are kept tight with bounded character classes to avoid
+#: quadratic backtracking if Basescan ever returns a pathological payload.
 _META_DESC_RE = re.compile(
     r'<meta\s+name=["\']Description["\']\s+content=["\']'
     r'Address\s*'
-    r'(?:\(([^)]*)\))?'
-    r'[^"\']*?'
-    r'\|\s*Balance:\s*\$?([\d,\.]+)'
-    r'(?:\s*across\s+(\d+)\s+Chains?)?'
-    r'[^"\']*?'
-    r'\|\s*Transactions:\s*([\d,]+)',
+    r'(?:\(([^)]{0,40})\))?'
+    r'[^"\']{0,200}?'
+    r'\|\s*Balance:\s*\$?([\d,\.]{1,30})'
+    r'(?:\s*across\s+(\d{1,3})\s+Chains?)?'
+    r'[^"\']{0,120}?'
+    r'\|\s*Transactions:\s*([\d,]{1,15})',
     re.IGNORECASE,
 )
 
+#: The First: block lives in a predictable span a few hundred bytes wide.
+#: We still slice the HTML before applying this regex (see
+#: _parse_basescan_html) so the engine never scans the full 500KB page.
 _FIRST_TX_RE = re.compile(
-    r'First:.{0,600}?<span[^>]*>([^<]+ago)</span>',
+    r"First:.{0,300}?<span[^>]{0,100}>([^<]{1,60}ago)</span>",
     re.DOTALL | re.IGNORECASE,
 )
 
@@ -153,10 +164,16 @@ def _parse_basescan_html(owner_wallet: str, html: str) -> dict | None:
         total_tx_count = 0
 
     # First-tx age only exists on wallets with at least one tx.
+    # Slice the HTML around the "First:" literal BEFORE running the regex
+    # so the engine never scans more than a fixed window (defense in
+    # depth against adversarial responses).
     age_days: int | None = None
-    first_m = _FIRST_TX_RE.search(html)
-    if first_m:
-        age_days = _parse_relative_age_days(first_m.group(1))
+    first_idx = html.find("First:")
+    if first_idx != -1:
+        window = html[first_idx : first_idx + 800]
+        first_m = _FIRST_TX_RE.search(window)
+        if first_m:
+            age_days = _parse_relative_age_days(first_m.group(1))
 
     return {
         "owner_wallet": owner_wallet,
@@ -182,16 +199,29 @@ def _fetch_basescan_html(
     Returns ``(html, status_code)``. On permanent failure returns
     ``(None, last_status_code)`` — the caller uses the status to decide
     whether to record a soft skip or to abort the whole cycle.
+
+    The owner_wallet value originates from DegenClaw API responses and
+    is therefore untrusted. We enforce a strict 0x-prefixed 40-hex-char
+    format before substituting into the URL template to prevent SSRF,
+    path traversal, or query-string injection.
     """
+    if not _ETH_ADDR_RE.fullmatch(owner_wallet or ""):
+        logger.warning(
+            "Skipping invalid owner_wallet %r — not a 0x...40 hex address",
+            (owner_wallet or "")[:64],
+        )
+        return None, None
     url = BASESCAN_URL_TEMPLATE.format(addr=owner_wallet)
     last_status: int | None = None
     for attempt in range(MAX_RETRIES):
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        headers = {"User-Agent": random.choice(USER_AGENTS)}  # noqa: S311
         try:
             resp = client.get(url, headers=headers, timeout=30)
             last_status = resp.status_code
             if resp.status_code == 200:
-                time.sleep(REQUEST_DELAY_S)
+                # The 2s polite delay is applied in run() between
+                # iterations, not here. Returning immediately lets the
+                # caller parse/upsert/sleep in one place.
                 return resp.text, 200
             if resp.status_code == 403:
                 logger.warning(
@@ -218,10 +248,10 @@ def _fetch_basescan_html(
                 owner_wallet, exc, backoff,
             )
             time.sleep(backoff)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "Basescan unexpected error for %s: %s", owner_wallet, exc,
-            )
+        except Exception:  # noqa: BLE001
+            # logger.exception captures the traceback; no need to pass
+            # the exception repr as an extra positional arg.
+            logger.exception("Basescan unexpected error for %s", owner_wallet)
             return None, None
     logger.error(
         "Basescan exhausted %d retries for %s (last status %s)",
@@ -250,7 +280,7 @@ def _load_owners_needing_refresh(sb: Any) -> list[str]:
     owners = sorted({
         r["owner_wallet"]
         for r in all_owners_rows
-        if r.get("owner_wallet")
+        if r.get("owner_wallet") and _ETH_ADDR_RE.fullmatch(r["owner_wallet"])
     })
     if not owners:
         return []
@@ -262,7 +292,6 @@ def _load_owners_needing_refresh(sb: Any) -> list[str]:
         .data
         or []
     )
-    from datetime import datetime, timedelta, timezone
 
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=REFRESH_INTERVAL_DAYS)
     fresh_set: set[str] = set()
@@ -313,8 +342,12 @@ def run() -> None:
     skipped = 0
     blocked = 0
 
-    with httpx.Client(follow_redirects=True) as client:
-        for owner in owners:
+    # follow_redirects intentionally False: Basescan never redirects an
+    # /address/ GET under normal operation, and refusing redirects closes
+    # any residual SSRF surface if a future Basescan response tries to
+    # 302 somewhere unexpected.
+    with httpx.Client(follow_redirects=False) as client:
+        for idx, owner in enumerate(owners):
             html, status = _fetch_basescan_html(client, owner)
             if status == 403:
                 blocked += 1
@@ -325,18 +358,20 @@ def run() -> None:
                         blocked,
                     )
                     break
-                continue
-            if html is None:
+            elif html is None:
                 skipped += 1
-                continue
-            row = _parse_basescan_html(owner_wallet=owner, html=html)
-            if row is None:
-                skipped += 1
-                continue
-            if _upsert_onchain_row(sb, row):
-                enriched += 1
             else:
-                skipped += 1
+                row = _parse_basescan_html(owner_wallet=owner, html=html)
+                if row is None:
+                    skipped += 1
+                elif _upsert_onchain_row(sb, row):
+                    enriched += 1
+                else:
+                    skipped += 1
+            # Polite delay between iterations. Skip the sleep on the
+            # last owner so we don't add 2s of dead weight to the tail.
+            if idx < len(owners) - 1:
+                time.sleep(REQUEST_DELAY_S)
 
     elapsed = time.time() - start
     logger.info(
