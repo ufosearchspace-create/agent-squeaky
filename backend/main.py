@@ -58,19 +58,18 @@ def main() -> None:
     )
     # Daily on-chain enrichment of owner wallets via Basescan HTML
     # scraping. Runs at 02:00 UTC so it sits in a quiet window and the
-    # ~45s Basescan cycle never overlaps the analyzer's 30m ticks.
-    #
-    # TEMPORARY: first run fires +3 minutes after process start so the
-    # initial PR3 deploy populates scanner_onchain without waiting for
-    # 02:00 UTC. Revert this to the next-02:00 calculation in a
-    # follow-up commit once the first enrichment completes.
-    first_onchain_run = now + timedelta(minutes=3)
+    # ~minute-long Basescan cycle never overlaps the analyzer's 30m
+    # ticks. First run is scheduled for the next 02:00 UTC after
+    # process start.
+    next_0200 = now.replace(hour=2, minute=0, second=0, microsecond=0)
+    if next_0200 <= now:
+        next_0200 = next_0200 + timedelta(days=1)
     scheduler.add_job(
         onchain_enricher.run,
         "interval",
         hours=24,
         id="onchain_enricher",
-        next_run_time=first_onchain_run,
+        next_run_time=next_0200,
     )
     logger.info(
         "Scheduler started: collector @+10s, candle_fetcher @+10m, "
