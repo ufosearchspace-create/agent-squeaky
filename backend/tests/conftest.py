@@ -101,6 +101,19 @@ _V1_STATES: dict[str, dict[str, float]] = {
     "B4b_pre_spike_entry_rate": {
         "neutral": 0.0, "weak_bot": 0.5,
     },
+    # Phase 4 onchain signals (PR3). Match migration 012_seed_onchain_lrs.sql.
+    "M1_owner_wallet_age": {
+        "medium_human": -1.5, "weak_human": -0.5, "neutral": 0.0, "weak_bot": 0.5,
+    },
+    "M2_owner_multi_chain": {
+        "medium_human": -1.5, "weak_human": -0.5, "neutral": 0.0,
+    },
+    "M3_owner_activity_score": {
+        "medium_human": -1.5, "weak_human": -0.5, "neutral": 0.0,
+    },
+    "M6_throwaway_owner_flag": {
+        "neutral": 0.0, "weak_bot": 0.5, "medium_bot": 1.5,
+    },
 }
 
 

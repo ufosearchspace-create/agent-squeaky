@@ -63,6 +63,8 @@ def _build_mock_sb(trades, labels=None):
                 return _Select(lambda: [])  # no siblings
             if self.name == "scanner_candles":
                 return _Select(lambda: [])  # no candles in unit test
+            if self.name == "scanner_onchain":
+                return _Select(lambda: [])  # no onchain in unit test
             return _Select(lambda: [])
 
         def insert(self, row):

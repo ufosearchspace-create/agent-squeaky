@@ -11,7 +11,14 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from config import TABLE_AGENTS, TABLE_CANDLES, TABLE_LABELS, TABLE_SCORES, TABLE_TRADES
+from config import (
+    TABLE_AGENTS,
+    TABLE_CANDLES,
+    TABLE_LABELS,
+    TABLE_ONCHAIN,
+    TABLE_SCORES,
+    TABLE_TRADES,
+)
 from db import get_client
 from scoring_engine import calibration
 from scoring_engine.base import SignalContext
@@ -20,6 +27,7 @@ from scoring_engine.classifier import classify
 from scoring_engine.gates import apply_hard_gates
 from scoring_engine.signals.behavioral import ALL_BEHAVIORAL_SIGNALS
 from scoring_engine.signals.meta import ALL_META_SIGNALS
+from scoring_engine.signals.onchain import ALL_ONCHAIN_SIGNALS
 from scoring_engine.signals.reaction import ALL_REACTION_SIGNALS
 from scoring_engine.signals.structural import ALL_STRUCTURAL_SIGNALS
 from scoring_engine.signals.temporal import ALL_TEMPORAL_SIGNALS
@@ -34,6 +42,7 @@ ALL_SIGNALS = (
     + ALL_STRUCTURAL_SIGNALS
     + ALL_BEHAVIORAL_SIGNALS
     + ALL_REACTION_SIGNALS
+    + ALL_ONCHAIN_SIGNALS
     + ALL_META_SIGNALS
 )
 
@@ -126,6 +135,42 @@ def _filter_candles_for_trades(
     return {coin: all_candles[coin] for coin in coins if coin in all_candles}
 
 
+def _load_all_onchain() -> dict[str, dict]:
+    """Fetch the entire scanner_onchain table into an in-memory index.
+
+    One query per analyzer cycle. The table holds at most a few hundred
+    rows (one per distinct owner_wallet) so this is trivial compared to
+    the 275 per-agent lookups the naive pattern would do. Returns
+    ``{owner_wallet_lowercase: onchain_row}``.
+    """
+    sb = get_client()
+    rows = (
+        sb.table(TABLE_ONCHAIN)
+        .select("*")
+        .execute()
+        .data
+        or []
+    )
+    out: dict[str, dict] = {}
+    for row in rows:
+        owner = row.get("owner_wallet")
+        if not owner:
+            continue
+        out[owner.lower()] = row
+    return out
+
+
+def _onchain_for_agent(
+    all_onchain: dict[str, dict],
+    agent: dict,
+) -> dict | None:
+    """Look up the onchain row for an agent's owner_wallet (case-insensitive)."""
+    owner = agent.get("owner_wallet")
+    if not owner:
+        return None
+    return all_onchain.get(owner.lower())
+
+
 def _load_owner_cluster(agent: dict) -> list[dict]:
     owner = agent.get("owner_wallet")
     if not owner:
@@ -148,12 +193,14 @@ def _load_owner_cluster(agent: dict) -> list[dict]:
 def score_agent(
     agent: dict,
     all_candles: dict[str, list[dict]] | None = None,
+    all_onchain: dict[str, dict] | None = None,
 ) -> dict | None:
     """Score one agent. Returns the inserted scanner_scores row or None.
 
-    ``all_candles`` is the shared per-run candle cache produced by
-    ``_load_all_candles``. When absent (e.g. direct unit tests) we fall
-    back to lazily loading the slice this agent needs.
+    ``all_candles`` and ``all_onchain`` are shared per-run caches
+    produced by ``_load_all_candles`` and ``_load_all_onchain``. When
+    either is absent (e.g. direct unit tests) we fall back to a lazy
+    load of the slice this agent actually needs.
     """
     sb = get_client()
     trades = (
@@ -178,11 +225,15 @@ def score_agent(
         all_candles = _load_all_candles()
     agent_candles = _filter_candles_for_trades(all_candles, trades)
 
+    if all_onchain is None:
+        all_onchain = _load_all_onchain()
+    agent_onchain = _onchain_for_agent(all_onchain, agent)
+
     ctx = SignalContext(
         agent=agent,
         trades=trades,
         candles=agent_candles,
-        onchain=None,  # populated in PR3
+        onchain=agent_onchain,
         now_ms=int(time.time() * 1000),
         owner_cluster=_load_owner_cluster(agent),
     )
@@ -196,7 +247,7 @@ def score_agent(
         agent=agent,
         trades=trades,
         owner_cluster=ctx.owner_cluster,
-        onchain=None,
+        onchain=agent_onchain,
         label=label,
         natural_class=natural,
     )
@@ -234,20 +285,26 @@ def run() -> None:
     calibration.reload_cache()
     sb = get_client()
 
-    # Load candles ONCE per cycle so per-agent scoring stays in-memory.
-    # This replaces the old N+1 per-agent candle query that was hitting
-    # Supabase 275 times per cycle.
+    # Load candles and onchain enrichment ONCE per cycle so per-agent
+    # scoring stays in-memory. Replaces the old N+1 pattern that was
+    # hitting Supabase 275 times per cycle.
     try:
         all_candles = _load_all_candles()
     except Exception:
         logger.exception("Failed to load candle cache; B4 will be skipped")
         all_candles = {}
+    try:
+        all_onchain = _load_all_onchain()
+        logger.info("Loaded %d onchain rows for analyzer cycle", len(all_onchain))
+    except Exception:
+        logger.exception("Failed to load onchain cache; M1/M2/M3/M6 will be skipped")
+        all_onchain = {}
 
     agents = sb.table(TABLE_AGENTS).select("*").execute().data or []
     scored = 0
     for agent in agents:
         try:
-            if score_agent(agent, all_candles=all_candles):
+            if score_agent(agent, all_candles=all_candles, all_onchain=all_onchain):
                 scored += 1
         except Exception:
             logger.exception("Scoring failed for agent %s", agent.get("id"))

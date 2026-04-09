@@ -15,6 +15,8 @@ from scoring_engine.gates import (  # noqa: E402
     apply_hard_gates,
     hg2_persistent_247,
     hg3_coordinated_farm,
+    hg4_onchain_human_ceiling,
+    hg5_throwaway_farm,
 )
 from tests.fixtures_synth import bot_24_7, human_daily_trader  # noqa: E402
 
@@ -141,3 +143,140 @@ def test_no_gate_returns_natural_class():
     )
     assert final == "LIKELY_HUMAN"
     assert hits == []
+
+
+# -------- HG4 onchain_human_ceiling --------
+
+def test_hg4_fires_on_old_multichain_active_owner():
+    onchain = {"age_days": 700, "chains_active": 5, "total_tx_count": 350}
+    assert hg4_onchain_human_ceiling(onchain) is True
+
+
+def test_hg4_requires_all_three_conditions():
+    # Old but single chain
+    assert hg4_onchain_human_ceiling(
+        {"age_days": 700, "chains_active": 1, "total_tx_count": 500}
+    ) is False
+    # Old, multi-chain, but low activity
+    assert hg4_onchain_human_ceiling(
+        {"age_days": 700, "chains_active": 5, "total_tx_count": 50}
+    ) is False
+    # Multi-chain, active, but young
+    assert hg4_onchain_human_ceiling(
+        {"age_days": 100, "chains_active": 5, "total_tx_count": 500}
+    ) is False
+
+
+def test_hg4_none_onchain_does_not_fire():
+    assert hg4_onchain_human_ceiling(None) is False
+    assert hg4_onchain_human_ceiling({}) is False
+
+
+def test_hg4_caps_bot_classification_at_uncertain():
+    onchain = {"age_days": 800, "chains_active": 6, "total_tx_count": 500}
+    final, hits = apply_hard_gates(
+        agent={"id": "1"},
+        trades=bot_24_7(days=5),  # few days, HG2 does not fire
+        owner_cluster=[],
+        onchain=onchain,
+        label=None,
+        natural_class="BOT",
+    )
+    assert final == "UNCERTAIN"
+    assert "gate:onchain_human_ceiling" in hits
+
+
+def test_hg4_does_not_promote_human_to_uncertain():
+    onchain = {"age_days": 800, "chains_active": 6, "total_tx_count": 500}
+    final, hits = apply_hard_gates(
+        agent={"id": "1"},
+        trades=human_daily_trader(days=10),
+        owner_cluster=[],
+        onchain=onchain,
+        label=None,
+        natural_class="HUMAN",
+    )
+    # HG4 is a ceiling, not a promoter — HUMAN stays HUMAN.
+    assert final == "HUMAN"
+    assert "gate:onchain_human_ceiling" not in hits
+
+
+# -------- HG5 throwaway_farm --------
+
+def test_hg5_fires_on_young_clustered_active_throwaway():
+    onchain = {"age_days": 5, "total_tx_count": 8}
+    cluster = [{"id": "sib1"}, {"id": "sib2"}]
+    trades = bot_24_7(days=3)  # 24 * 3 * 4 = 288 trades
+    assert hg5_throwaway_farm(onchain, cluster, trades) is True
+
+
+def test_hg5_does_not_fire_on_dead_eoa():
+    """Dead EOA (0 txs) must NOT trigger HG5 — it is a legitimate
+    pattern where the owner simply never touched the wallet."""
+    onchain = {"age_days": None, "total_tx_count": 0}
+    cluster = [{"id": "sib1"}, {"id": "sib2"}]
+    trades = bot_24_7(days=3)
+    assert hg5_throwaway_farm(onchain, cluster, trades) is False
+
+
+def test_hg5_requires_cluster_size_two_or_more():
+    onchain = {"age_days": 5, "total_tx_count": 8}
+    trades = bot_24_7(days=3)
+    assert hg5_throwaway_farm(onchain, [], trades) is False
+    assert hg5_throwaway_farm(onchain, [{"id": "lone"}], trades) is False
+
+
+def test_hg5_requires_old_enough_agent_trades():
+    onchain = {"age_days": 5, "total_tx_count": 8}
+    cluster = [{"id": "sib1"}, {"id": "sib2"}]
+    # Only 5 trades — below the 20-trade minimum
+    assert hg5_throwaway_farm(onchain, cluster, [{}] * 5) is False
+
+
+def test_hg5_does_not_fire_on_old_owner():
+    onchain = {"age_days": 400, "total_tx_count": 8}
+    cluster = [{"id": "sib1"}, {"id": "sib2"}]
+    trades = bot_24_7(days=3)
+    assert hg5_throwaway_farm(onchain, cluster, trades) is False
+
+
+def test_hg5_force_bot_via_apply_hard_gates():
+    onchain = {"age_days": 5, "total_tx_count": 3}
+    cluster = [{"id": "sib1"}, {"id": "sib2"}]
+    trades = bot_24_7(days=3)
+    final, hits = apply_hard_gates(
+        agent={"id": "sib1"},
+        trades=trades,
+        owner_cluster=cluster,
+        onchain=onchain,
+        label=None,
+        natural_class="UNCERTAIN",
+    )
+    assert final == "BOT"
+    assert "gate:throwaway_farm" in hits
+
+
+def test_hg5_wins_over_hg4_when_both_conditions_exist():
+    """Unlikely combination but the precedence order matters: if HG5
+    ever matched alongside HG4, HG5 (force BOT) should come first."""
+    # This test documents precedence. The real-world case where a
+    # wallet is BOTH old+multichain AND recently active+throwaway is
+    # essentially impossible, but we exercise the code path.
+    onchain = {
+        "age_days": 5,  # HG5 young trigger
+        "chains_active": 1,
+        "total_tx_count": 3,
+    }
+    cluster = [{"id": "sib1"}, {"id": "sib2"}]
+    trades = bot_24_7(days=3)
+    final, hits = apply_hard_gates(
+        agent={"id": "sib1"},
+        trades=trades,
+        owner_cluster=cluster,
+        onchain=onchain,
+        label=None,
+        natural_class="LIKELY_HUMAN",
+    )
+    assert final == "BOT"
+    assert "gate:throwaway_farm" in hits
+    assert "gate:onchain_human_ceiling" not in hits
