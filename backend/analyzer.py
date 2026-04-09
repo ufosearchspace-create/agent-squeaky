@@ -11,7 +11,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from config import TABLE_AGENTS, TABLE_LABELS, TABLE_SCORES, TABLE_TRADES
+from config import TABLE_AGENTS, TABLE_CANDLES, TABLE_LABELS, TABLE_SCORES, TABLE_TRADES
 from db import get_client
 from scoring_engine import calibration
 from scoring_engine.base import SignalContext
@@ -20,6 +20,7 @@ from scoring_engine.classifier import classify
 from scoring_engine.gates import apply_hard_gates
 from scoring_engine.signals.behavioral import ALL_BEHAVIORAL_SIGNALS
 from scoring_engine.signals.meta import ALL_META_SIGNALS
+from scoring_engine.signals.reaction import ALL_REACTION_SIGNALS
 from scoring_engine.signals.structural import ALL_STRUCTURAL_SIGNALS
 from scoring_engine.signals.temporal import ALL_TEMPORAL_SIGNALS
 
@@ -32,6 +33,7 @@ ALL_SIGNALS = (
     ALL_TEMPORAL_SIGNALS
     + ALL_STRUCTURAL_SIGNALS
     + ALL_BEHAVIORAL_SIGNALS
+    + ALL_REACTION_SIGNALS
     + ALL_META_SIGNALS
 )
 
@@ -49,6 +51,38 @@ def _load_label(agent_id: str) -> str | None:
     if rows:
         return rows[0].get("label")
     return None
+
+
+def _load_candles_for_trades(trades: list[dict], lookback_days: int = 15) -> dict[str, list[dict]]:
+    """Fetch 5m candles for every distinct coin in ``trades``.
+
+    Returns ``{coin: [candle, ...]}`` where each candle has the keys the
+    reaction signals expect (ts_ms, open, high, low, close, volume).
+    Only pulls candles newer than ``lookback_days`` to keep the payload
+    bounded — B4 only cares about spike-to-trade proximity within minutes.
+    """
+    sb = get_client()
+    coins = sorted({t["coin"] for t in trades if t.get("coin")})
+    if not coins:
+        return {}
+    now_ms = int(time.time() * 1000)
+    since_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
+    out: dict[str, list[dict]] = {}
+    for coin in coins:
+        rows = (
+            sb.table(TABLE_CANDLES)
+            .select("ts_ms,open,high,low,close,volume")
+            .eq("coin", coin)
+            .eq("interval", "5m")
+            .gte("ts_ms", since_ms)
+            .order("ts_ms")
+            .execute()
+            .data
+            or []
+        )
+        if rows:
+            out[coin] = rows
+    return out
 
 
 def _load_owner_cluster(agent: dict) -> list[dict]:
@@ -94,7 +128,7 @@ def score_agent(agent: dict) -> dict | None:
     ctx = SignalContext(
         agent=agent,
         trades=trades,
-        candles={},
+        candles=_load_candles_for_trades(trades),
         onchain=None,  # populated in PR3
         now_ms=int(time.time() * 1000),
         owner_cluster=_load_owner_cluster(agent),
