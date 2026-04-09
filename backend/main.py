@@ -25,26 +25,13 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     logger.info("=== Agent Squeaky Scanner starting ===")
 
-    # Warm start: one full pass before the scheduler takes over. Order
-    # matters — candles must exist before analyzer runs B4/B4b.
-    try:
-        collector.run()
-    except Exception:
-        logger.exception("Initial collection failed")
-    try:
-        candle_fetcher.run()
-    except Exception:
-        logger.exception("Initial candle fetch failed")
-    try:
-        analyzer.run()
-    except Exception:
-        logger.exception("Initial analysis failed")
-
-    # Stagger the scheduled ticks so the three jobs run in sequence and
-    # never fight each other for the Supabase connection or for the
-    # DegenClaw / Hyperliquid rate limits. The first tick happens 30
-    # minutes after the warm start for collector, then +10 and +20
-    # minutes for candle_fetcher and analyzer respectively.
+    # No warm start block: a previous version ran all three jobs in
+    # sequence inside main() before starting the scheduler, which could
+    # take 10+ minutes of wall-clock time and hid any crash from the
+    # scheduler's perspective (warm start failures were only visible in
+    # Railway logs). Instead, we schedule the three jobs with small
+    # offsets from now() so the first execution begins shortly after
+    # process start and any crash shows up in the normal scheduled run.
     now = datetime.now(tz=timezone.utc)
     scheduler = BlockingScheduler()
     scheduler.add_job(
@@ -52,25 +39,25 @@ def main() -> None:
         "interval",
         minutes=30,
         id="collector",
-        next_run_time=now + timedelta(minutes=30),
+        next_run_time=now + timedelta(seconds=10),
     )
     scheduler.add_job(
         candle_fetcher.run,
         "interval",
         minutes=30,
         id="candle_fetcher",
-        next_run_time=now + timedelta(minutes=40),
+        next_run_time=now + timedelta(minutes=10),
     )
     scheduler.add_job(
         analyzer.run,
         "interval",
         minutes=30,
         id="analyzer",
-        next_run_time=now + timedelta(minutes=50),
+        next_run_time=now + timedelta(minutes=20),
     )
     logger.info(
-        "Scheduler started: collector @+30m, candle_fetcher @+40m, "
-        "analyzer @+50m (each repeats every 30m thereafter)"
+        "Scheduler started: collector @+10s, candle_fetcher @+10m, "
+        "analyzer @+20m (each repeats every 30m thereafter)"
     )
     scheduler.start()
 
