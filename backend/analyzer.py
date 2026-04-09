@@ -53,52 +53,77 @@ def _load_label(agent_id: str) -> str | None:
     return None
 
 
-def _load_candles_for_trades(
-    trades: list[dict],
-    lookback_days: int = 15,
-) -> dict[str, list[dict]]:
-    """Fetch 5m candles for every distinct coin in ``trades``.
+#: Maximum candles we keep in memory per coin. 288 candles/day × 15 days
+#: = 4320; we add a small headroom so the post-ts filter never trims too
+#: aggressively.
+_CANDLES_PER_COIN_CAP = 4500
 
-    Returns ``{coin: [candle, ...]}`` with the columns the reaction
-    signals need. The query uses ``.in_("coin", coins)`` so the whole
-    agent payload is one round-trip regardless of how many coins they
-    trade. The candle field carries ``coin`` so we can bucket client-side.
 
-    Lookback is capped at 15 days because B4 only cares about
-    spike-to-trade proximity within minutes; older candles are dead weight.
-    The limit is sized generously enough to hold ``coins_per_agent ×
-    candles_per_coin`` without tripping Supabase's default 1000-row cap
-    silently.
+def _load_all_candles(lookback_days: int = 15) -> dict[str, list[dict]]:
+    """Fetch all 5m candles for the last ``lookback_days`` in one pass.
+
+    The analyzer calls this once per ``run()`` and keeps the result in
+    memory for every subsequent ``score_agent`` call. This avoids the
+    old N+1 per-agent pattern that would otherwise issue 275 sequential
+    ``.in_("coin", …)`` queries, each returning up to ~80k rows.
+
+    We fetch the rows coin-by-coin in ascending ``ts_ms`` order so that
+    each individual query stays below Supabase's default row cap
+    (1000 rows pre-configured, 10000 hard ceiling). _CANDLES_PER_COIN_CAP
+    is comfortably below both. Fetching the dataset in slices keeps the
+    payload on each HTTP response small enough to avoid timeouts.
     """
-    coins = sorted({t["coin"] for t in trades if t.get("coin")})
-    if not coins:
-        return {}
     sb = get_client()
     now_ms = int(time.time() * 1000)
     since_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
-    # 288 candles/day × lookback × #coins, plus generous headroom so we
-    # never silently truncate. PostgREST hard-caps at 10000 by default;
-    # we ask for the full set.
-    max_rows = len(coins) * lookback_days * 300 + 1000
-    rows = (
-        sb.table(TABLE_CANDLES)
-        .select("coin,ts_ms,open,high,low,close,volume")
-        .in_("coin", coins)
-        .eq("interval", "5m")
-        .gte("ts_ms", since_ms)
-        .order("ts_ms")
-        .limit(max_rows)
+
+    # Discover which coins actually have candles in the window. One cheap
+    # query against scanner_trades to get the working set.
+    recent_coins_rows = (
+        sb.table(TABLE_TRADES)
+        .select("coin")
+        .gte("closed_at_ms", since_ms)
         .execute()
         .data
         or []
     )
+    coins = sorted({r["coin"] for r in recent_coins_rows if r.get("coin")})
+    if not coins:
+        return {}
+
     out: dict[str, list[dict]] = {}
-    for row in rows:
-        coin = row.get("coin")
-        if not coin:
-            continue
-        out.setdefault(coin, []).append(row)
+    for coin in coins:
+        rows = (
+            sb.table(TABLE_CANDLES)
+            .select("ts_ms,open,high,low,close,volume")
+            .eq("coin", coin)
+            .eq("interval", "5m")
+            .gte("ts_ms", since_ms)
+            .order("ts_ms")
+            .limit(_CANDLES_PER_COIN_CAP)
+            .execute()
+            .data
+            or []
+        )
+        if rows:
+            out[coin] = rows
+    logger.info(
+        "Loaded %d candle rows across %d coins for analyzer cycle",
+        sum(len(v) for v in out.values()),
+        len(out),
+    )
     return out
+
+
+def _filter_candles_for_trades(
+    all_candles: dict[str, list[dict]],
+    trades: list[dict],
+) -> dict[str, list[dict]]:
+    """Project the shared candle cache onto the coins a single agent traded."""
+    if not all_candles:
+        return {}
+    coins = {t["coin"] for t in trades if t.get("coin")}
+    return {coin: all_candles[coin] for coin in coins if coin in all_candles}
 
 
 def _load_owner_cluster(agent: dict) -> list[dict]:
@@ -120,8 +145,16 @@ def _load_owner_cluster(agent: dict) -> list[dict]:
     return rows
 
 
-def score_agent(agent: dict) -> dict | None:
-    """Score one agent. Returns the inserted scanner_scores row or None."""
+def score_agent(
+    agent: dict,
+    all_candles: dict[str, list[dict]] | None = None,
+) -> dict | None:
+    """Score one agent. Returns the inserted scanner_scores row or None.
+
+    ``all_candles`` is the shared per-run candle cache produced by
+    ``_load_all_candles``. When absent (e.g. direct unit tests) we fall
+    back to lazily loading the slice this agent needs.
+    """
     sb = get_client()
     trades = (
         sb.table(TABLE_TRADES)
@@ -141,10 +174,14 @@ def score_agent(agent: dict) -> dict | None:
         )
         return None
 
+    if all_candles is None:
+        all_candles = _load_all_candles()
+    agent_candles = _filter_candles_for_trades(all_candles, trades)
+
     ctx = SignalContext(
         agent=agent,
         trades=trades,
-        candles=_load_candles_for_trades(trades),
+        candles=agent_candles,
         onchain=None,  # populated in PR3
         now_ms=int(time.time() * 1000),
         owner_cluster=_load_owner_cluster(agent),
@@ -197,11 +234,20 @@ def run() -> None:
     calibration.reload_cache()
     sb = get_client()
 
+    # Load candles ONCE per cycle so per-agent scoring stays in-memory.
+    # This replaces the old N+1 per-agent candle query that was hitting
+    # Supabase 275 times per cycle.
+    try:
+        all_candles = _load_all_candles()
+    except Exception:
+        logger.exception("Failed to load candle cache; B4 will be skipped")
+        all_candles = {}
+
     agents = sb.table(TABLE_AGENTS).select("*").execute().data or []
     scored = 0
     for agent in agents:
         try:
-            if score_agent(agent):
+            if score_agent(agent, all_candles=all_candles):
                 scored += 1
         except Exception:
             logger.exception("Scoring failed for agent %s", agent.get("id"))
