@@ -129,6 +129,13 @@ def _fetch_candles(
     Returns the raw API candle dicts (list) on success, or an empty list
     after exhausting retries. The caller is responsible for converting to
     scanner_candles rows via ``_candle_to_row``.
+
+    Retry policy:
+      * transport errors and 5xx responses: retry with exponential
+        backoff up to MAX_RETRIES;
+      * 429 rate-limit: retry with exponential backoff;
+      * 4xx other than 429: log and return [] immediately (client bug,
+        retrying wastes rate-limit budget).
     """
     body = {
         "type": "candleSnapshot",
@@ -151,13 +158,35 @@ def _fetch_candles(
                 return data
             logger.warning("Unexpected candle response for %s: %s", coin, type(data))
             return []
-        except Exception as exc:
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status != 429 and 400 <= status < 500:
+                logger.error(
+                    "candleSnapshot %s non-retryable HTTP %d: %s",
+                    coin, status, exc,
+                )
+                return []
             backoff = 2 ** attempt
             logger.warning(
-                "candleSnapshot %s attempt %d failed: %s — sleeping %ds",
+                "candleSnapshot %s attempt %d failed HTTP %d: sleeping %ds",
+                coin, attempt + 1, status, backoff,
+            )
+            time.sleep(backoff)
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            backoff = 2 ** attempt
+            logger.warning(
+                "candleSnapshot %s attempt %d transport error: %s — sleeping %ds",
                 coin, attempt + 1, exc, backoff,
             )
             time.sleep(backoff)
+        except Exception as exc:
+            # Non-HTTP, non-transport: likely a JSON decode error or a
+            # stray bug. Log with exception so we see the traceback and
+            # bail out — retrying will not help.
+            logger.exception(
+                "candleSnapshot %s unexpected error: %s", coin, exc,
+            )
+            return []
     logger.error("candleSnapshot %s failed after %d retries", coin, MAX_RETRIES)
     return []
 
@@ -189,49 +218,58 @@ def _load_coin_counts(sb: Any, since_ms: int) -> list[dict]:
 
 
 def _existing_candle_stats(sb: Any, coin: str) -> tuple[int, int | None]:
-    """Return (row_count, max_ts_ms) for a coin/interval pair."""
-    rows = (
+    """Return (row_count, max_ts_ms) for a coin/interval pair.
+
+    Collapses the count + max-ts check into a single HTTP round-trip:
+    Supabase-py's ``count="exact"`` returns the total count alongside
+    the one row we already need for ``max_ts``.
+    """
+    result = (
         sb.table(TABLE_CANDLES)
-        .select("ts_ms")
+        .select("ts_ms", count="exact")
         .eq("coin", coin)
         .eq("interval", INTERVAL)
         .order("ts_ms", desc=True)
         .limit(1)
         .execute()
-        .data
-        or []
     )
+    rows = getattr(result, "data", None) or []
+    count = getattr(result, "count", None) or 0
     max_ts = rows[0]["ts_ms"] if rows else None
-    # A second query for the count. Supabase-py's .count('exact') would
-    # do this in one round-trip but we keep it simple and explicit.
-    count_rows = (
-        sb.table(TABLE_CANDLES)
-        .select("ts_ms", count="exact")
-        .eq("coin", coin)
-        .eq("interval", INTERVAL)
-        .limit(1)
-        .execute()
-    )
-    count = getattr(count_rows, "count", None) or 0
     return count, max_ts
 
 
+UPSERT_BATCH_SIZE = 500
+
+
 def _upsert_candles(sb: Any, rows: list[dict]) -> int:
+    """Bulk upsert candles in batches to avoid N+1 round-trips.
+
+    Hyperliquid returns time-sorted ascending; the natural PK is
+    (coin, interval, ts_ms) so ON CONFLICT is idempotent. We chunk in
+    batches of ``UPSERT_BATCH_SIZE`` so a 15-day backfill (~4300 rows
+    per coin × ~50 coins) finishes in a handful of requests instead of
+    hundreds of thousands.
+    """
     if not rows:
         return 0
+    valid = [r for r in rows if r.get("coin") and r.get("ts_ms") is not None]
+    if not valid:
+        return 0
     inserted = 0
-    # Hyperliquid returns time-sorted ascending; the natural PK is
-    # (coin, interval, ts_ms) so on-conflict is idempotent.
-    for row in rows:
-        if not row.get("coin") or row.get("ts_ms") is None:
-            continue
+    for start in range(0, len(valid), UPSERT_BATCH_SIZE):
+        chunk = valid[start : start + UPSERT_BATCH_SIZE]
         try:
             sb.table(TABLE_CANDLES).upsert(
-                row, on_conflict="coin,interval,ts_ms"
+                chunk, on_conflict="coin,interval,ts_ms"
             ).execute()
-            inserted += 1
+            inserted += len(chunk)
         except Exception:
-            logger.exception("Failed to upsert candle %s @ %s", row.get("coin"), row.get("ts_ms"))
+            logger.exception(
+                "Failed to upsert candle batch (coin=%s size=%d)",
+                chunk[0].get("coin"),
+                len(chunk),
+            )
     return inserted
 
 
@@ -296,7 +334,16 @@ def run() -> None:
             logger.info("Backfill %s: %d candles", coin, len(raw))
         else:
             # Incremental: skip forward from the last stored candle close.
-            assert max_ts is not None
+            # Guard against a race where the count query saw >=MIN rows
+            # but a concurrent TTL delete emptied the table before we
+            # read max_ts. Treat that as "no data" and fall through to
+            # the next coin; the next cycle will retry naturally.
+            if max_ts is None:
+                logger.warning(
+                    "Coin %s: count=%d but max_ts is None, skipping",
+                    coin, existing_count,
+                )
+                continue
             incremental_start = max_ts + INTERVAL_MS
             if incremental_start >= now:
                 continue

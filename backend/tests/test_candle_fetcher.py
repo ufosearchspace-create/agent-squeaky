@@ -103,10 +103,14 @@ def test_fetch_candles_calls_api_with_correct_body():
 
 
 def test_fetch_candles_retries_on_429():
-    # First call returns 429, second call succeeds.
+    import httpx
+
+    # First call raises a 429, second call succeeds.
+    bad_response = MagicMock(status_code=429)
     bad = MagicMock()
-    bad.status_code = 429
-    bad.raise_for_status.side_effect = Exception("429 Too Many")
+    bad.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "429 Too Many", request=MagicMock(), response=bad_response
+    )
     good = MagicMock()
     good.raise_for_status = MagicMock()
     good.json.return_value = json.loads(FIXTURE.read_text())
@@ -116,10 +120,30 @@ def test_fetch_candles_retries_on_429():
     assert len(candles) == 5
 
 
-def test_fetch_candles_gives_up_after_max_retries():
+def test_fetch_candles_does_not_retry_on_4xx_other_than_429():
+    import httpx
+
+    bad_response = MagicMock(status_code=401)
     bad = MagicMock()
-    bad.raise_for_status.side_effect = Exception("500 Server Error")
-    with patch("candle_fetcher.httpx.post", return_value=bad), \
+    bad.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "401 Unauthorized", request=MagicMock(), response=bad_response
+    )
+    with patch("candle_fetcher.httpx.post", return_value=bad) as post, \
          patch("candle_fetcher.time.sleep"):
         candles = candle_fetcher._fetch_candles("HYPE", "5m", 0, 1)
     assert candles == []
+    # Exactly one call — no retry after a non-retryable 4xx.
+    assert post.call_count == 1
+
+
+def test_fetch_candles_gives_up_after_max_retries_on_transport_errors():
+    import httpx
+
+    def raise_transport(*_args, **_kwargs):
+        raise httpx.ConnectError("boom", request=MagicMock())
+
+    with patch("candle_fetcher.httpx.post", side_effect=raise_transport) as post, \
+         patch("candle_fetcher.time.sleep"):
+        candles = candle_fetcher._fetch_candles("HYPE", "5m", 0, 1)
+    assert candles == []
+    assert post.call_count == candle_fetcher.MAX_RETRIES

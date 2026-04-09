@@ -10,6 +10,7 @@ sub-second sampler would justify).
 """
 from __future__ import annotations
 
+import bisect
 import math
 from collections import defaultdict
 
@@ -85,6 +86,10 @@ def _collect_samples(ctx: SignalContext) -> dict[str, list[int]]:
     For each trade we locate the nearest spike candle within
     MAX_LAG_BUCKETS and record the lag in bucket units. Negative lag
     means the trade opened BEFORE the spike (kept for B4b).
+
+    Spike timestamps are already sorted ascending (candles flow in
+    chronological order), so we use ``bisect`` to find the nearest
+    spike in O(log n) instead of scanning the whole list per trade.
     """
     by_coin = _candles_by_coin(ctx)
     spike_ts_by_coin: dict[str, list[int]] = {}
@@ -101,8 +106,17 @@ def _collect_samples(ctx: SignalContext) -> dict[str, list[int]]:
         if not spikes:
             continue
         trade_bucket_start = (opened // BUCKET_MS) * BUCKET_MS
+        # Nearest spike lookup via bisect — we only need to check the
+        # spike immediately at or after trade_bucket_start and the one
+        # immediately before it.
+        idx = bisect.bisect_left(spikes, trade_bucket_start)
+        candidates: list[int] = []
+        if idx < len(spikes):
+            candidates.append(spikes[idx])
+        if idx > 0:
+            candidates.append(spikes[idx - 1])
         best_lag: int | None = None
-        for spike_ts in spikes:
+        for spike_ts in candidates:
             lag = (trade_bucket_start - spike_ts) // BUCKET_MS
             if abs(lag) > MAX_LAG_BUCKETS:
                 continue
@@ -117,7 +131,7 @@ def _flatten_positive_lags(samples: dict[str, list[int]]) -> list[int]:
     """Keep only non-negative lags (trade AFTER spike), for B4."""
     out: list[int] = []
     for lags in samples.values():
-        out.extend(l for l in lags if l >= 0)
+        out.extend(lag for lag in lags if lag >= 0)
     return out
 
 
@@ -154,9 +168,9 @@ def signal_b4_price_reaction_lag(ctx: SignalContext) -> EvidenceScore | None:
         return None
 
     median_lag = _median_int(post_spike_lags)
-    same_bucket = sum(1 for l in post_spike_lags if l == 0)
+    same_bucket = sum(1 for lag in post_spike_lags if lag == 0)
     same_bucket_pct = same_bucket / len(post_spike_lags)
-    within_one = sum(1 for l in post_spike_lags if l <= 1)
+    within_one = sum(1 for lag in post_spike_lags if lag <= 1)
     within_one_pct = within_one / len(post_spike_lags)
     lag_cv = _cv(post_spike_lags)
 
@@ -204,7 +218,7 @@ def signal_b4b_pre_spike_entry_rate(ctx: SignalContext) -> EvidenceScore | None:
     if len(all_lags) < MIN_SAMPLES:
         return None
 
-    pre_spike = sum(1 for l in all_lags if l < 0)
+    pre_spike = sum(1 for lag in all_lags if lag < 0)
     pre_spike_rate = pre_spike / len(all_lags)
 
     if pre_spike_rate > 0.3:

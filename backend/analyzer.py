@@ -53,35 +53,51 @@ def _load_label(agent_id: str) -> str | None:
     return None
 
 
-def _load_candles_for_trades(trades: list[dict], lookback_days: int = 15) -> dict[str, list[dict]]:
+def _load_candles_for_trades(
+    trades: list[dict],
+    lookback_days: int = 15,
+) -> dict[str, list[dict]]:
     """Fetch 5m candles for every distinct coin in ``trades``.
 
-    Returns ``{coin: [candle, ...]}`` where each candle has the keys the
-    reaction signals expect (ts_ms, open, high, low, close, volume).
-    Only pulls candles newer than ``lookback_days`` to keep the payload
-    bounded — B4 only cares about spike-to-trade proximity within minutes.
+    Returns ``{coin: [candle, ...]}`` with the columns the reaction
+    signals need. The query uses ``.in_("coin", coins)`` so the whole
+    agent payload is one round-trip regardless of how many coins they
+    trade. The candle field carries ``coin`` so we can bucket client-side.
+
+    Lookback is capped at 15 days because B4 only cares about
+    spike-to-trade proximity within minutes; older candles are dead weight.
+    The limit is sized generously enough to hold ``coins_per_agent ×
+    candles_per_coin`` without tripping Supabase's default 1000-row cap
+    silently.
     """
-    sb = get_client()
     coins = sorted({t["coin"] for t in trades if t.get("coin")})
     if not coins:
         return {}
+    sb = get_client()
     now_ms = int(time.time() * 1000)
     since_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
+    # 288 candles/day × lookback × #coins, plus generous headroom so we
+    # never silently truncate. PostgREST hard-caps at 10000 by default;
+    # we ask for the full set.
+    max_rows = len(coins) * lookback_days * 300 + 1000
+    rows = (
+        sb.table(TABLE_CANDLES)
+        .select("coin,ts_ms,open,high,low,close,volume")
+        .in_("coin", coins)
+        .eq("interval", "5m")
+        .gte("ts_ms", since_ms)
+        .order("ts_ms")
+        .limit(max_rows)
+        .execute()
+        .data
+        or []
+    )
     out: dict[str, list[dict]] = {}
-    for coin in coins:
-        rows = (
-            sb.table(TABLE_CANDLES)
-            .select("ts_ms,open,high,low,close,volume")
-            .eq("coin", coin)
-            .eq("interval", "5m")
-            .gte("ts_ms", since_ms)
-            .order("ts_ms")
-            .execute()
-            .data
-            or []
-        )
-        if rows:
-            out[coin] = rows
+    for row in rows:
+        coin = row.get("coin")
+        if not coin:
+            continue
+        out.setdefault(coin, []).append(row)
     return out
 
 

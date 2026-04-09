@@ -30,6 +30,9 @@ def _build_mock_sb(trades, labels=None):
         def eq(self, *_args, **_kwargs):
             return self
 
+        def in_(self, *_args, **_kwargs):
+            return self
+
         def gte(self, *_args, **_kwargs):
             return self
 
