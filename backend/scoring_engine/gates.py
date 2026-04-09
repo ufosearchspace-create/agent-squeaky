@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable, Optional  # noqa: F401  (Optional used in annotations)
 
 
 def _per_day_active_hours(trades: Iterable[dict]) -> dict[str, set[int]]:
@@ -74,6 +74,61 @@ def hg3_coordinated_farm(owner_cluster: list[dict]) -> bool:
     return any(c >= 3 for c in counts.values())
 
 
+def hg4_onchain_human_ceiling(onchain: Optional[dict]) -> bool:
+    """HG4: owner wallet is clearly a seasoned crypto user.
+
+    Fires when all three conditions hold:
+      * age_days >= 365 — wallet is at least a year old on Base
+      * chains_active >= 3 — has tx history on multiple EVM chains
+      * total_tx_count >= 100 — real on-chain usage, not a parked EOA
+
+    Effect in apply_hard_gates: caps a BOT / LIKELY_BOT natural class
+    at UNCERTAIN. Does NOT promote anything toward HUMAN — a seasoned
+    crypto operator can still run a bot. HG4 just says "we're not
+    confident enough in BOT when the owner behind it has this much
+    genuine history."
+    """
+    if not onchain:
+        return False
+    if (onchain.get("age_days") or 0) < 365:
+        return False
+    if (onchain.get("chains_active") or 0) < 3:
+        return False
+    if (onchain.get("total_tx_count") or 0) < 100:
+        return False
+    return True
+
+
+def hg5_throwaway_farm(
+    onchain: Optional[dict],
+    owner_cluster: list[dict],
+    trades: list[dict],
+) -> bool:
+    """HG5: young throwaway owner wallet with a sibling agent cluster.
+
+    Fires when all four conditions hold:
+      * age_days < 30 — owner wallet is young
+      * total_tx_count > 0 — NOT a dead EOA (0 txs is legitimate)
+      * owner_cluster_size >= 2 — at least one sibling agent under
+        the same owner
+      * agent has >= 20 trades — enough activity that the throwaway
+        pattern actually matters
+
+    Effect in apply_hard_gates: force BOT with gate:throwaway_farm tag.
+    """
+    if not onchain:
+        return False
+    if (onchain.get("age_days") or 999) >= 30:
+        return False
+    if (onchain.get("total_tx_count") or 0) == 0:
+        return False
+    if not owner_cluster or len(owner_cluster) < 2:
+        return False
+    if len(trades) < 20:
+        return False
+    return True
+
+
 def apply_hard_gates(
     agent: dict,
     trades: list[dict],
@@ -105,12 +160,22 @@ def apply_hard_gates(
         hits.append(f"gate:farm_{len(owner_cluster)}")
         return "BOT", hits
 
-    # HG4 / HG5 placeholders (Phase 4).
-    # if onchain and hg4_onchain_human_ceiling(onchain) and natural_class in ("BOT", "LIKELY_BOT"):
-    #     hits.append("gate:onchain_human_ceiling")
-    #     return "UNCERTAIN", hits
-    # if onchain and hg5_throwaway_farm(onchain, agent, trades):
-    #     hits.append("gate:throwaway_farm")
-    #     return "BOT", hits
+    # HG5 (throwaway farm) takes precedence over HG4 (ceiling) because
+    # throwaway detection is a stronger, more specific signal than the
+    # generic "seasoned wallet" ceiling. In practice the two can't fire
+    # together — an age<30 owner cannot also be age>=365 — but the
+    # explicit precedence documents intent for anyone reading this.
+    if hg5_throwaway_farm(onchain, owner_cluster, trades):
+        hits.append("gate:throwaway_farm")
+        return "BOT", hits
+
+    # HG4 (ceiling): cap BOT/LIKELY_BOT at UNCERTAIN when the owner
+    # wallet has a legit seasoned crypto profile.
+    if (
+        hg4_onchain_human_ceiling(onchain)
+        and natural_class in ("BOT", "LIKELY_BOT")
+    ):
+        hits.append("gate:onchain_human_ceiling")
+        return "UNCERTAIN", hits
 
     return natural_class, hits
