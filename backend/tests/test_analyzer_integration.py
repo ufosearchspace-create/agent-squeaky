@@ -30,7 +30,19 @@ def _build_mock_sb(trades, labels=None):
         def eq(self, *_args, **_kwargs):
             return self
 
+        def in_(self, *_args, **_kwargs):
+            return self
+
+        def gte(self, *_args, **_kwargs):
+            return self
+
+        def lt(self, *_args, **_kwargs):
+            return self
+
         def order(self, *_args, **_kwargs):
+            return self
+
+        def limit(self, *_args, **_kwargs):
             return self
 
         def execute(self):
@@ -49,6 +61,8 @@ def _build_mock_sb(trades, labels=None):
                 return _Select(lambda: labels or [])
             if self.name == "scanner_agents":
                 return _Select(lambda: [])  # no siblings
+            if self.name == "scanner_candles":
+                return _Select(lambda: [])  # no candles in unit test
             return _Select(lambda: [])
 
         def insert(self, row):

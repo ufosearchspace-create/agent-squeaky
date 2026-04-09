@@ -11,7 +11,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from config import TABLE_AGENTS, TABLE_LABELS, TABLE_SCORES, TABLE_TRADES
+from config import TABLE_AGENTS, TABLE_CANDLES, TABLE_LABELS, TABLE_SCORES, TABLE_TRADES
 from db import get_client
 from scoring_engine import calibration
 from scoring_engine.base import SignalContext
@@ -20,6 +20,7 @@ from scoring_engine.classifier import classify
 from scoring_engine.gates import apply_hard_gates
 from scoring_engine.signals.behavioral import ALL_BEHAVIORAL_SIGNALS
 from scoring_engine.signals.meta import ALL_META_SIGNALS
+from scoring_engine.signals.reaction import ALL_REACTION_SIGNALS
 from scoring_engine.signals.structural import ALL_STRUCTURAL_SIGNALS
 from scoring_engine.signals.temporal import ALL_TEMPORAL_SIGNALS
 
@@ -32,6 +33,7 @@ ALL_SIGNALS = (
     ALL_TEMPORAL_SIGNALS
     + ALL_STRUCTURAL_SIGNALS
     + ALL_BEHAVIORAL_SIGNALS
+    + ALL_REACTION_SIGNALS
     + ALL_META_SIGNALS
 )
 
@@ -49,6 +51,54 @@ def _load_label(agent_id: str) -> str | None:
     if rows:
         return rows[0].get("label")
     return None
+
+
+def _load_candles_for_trades(
+    trades: list[dict],
+    lookback_days: int = 15,
+) -> dict[str, list[dict]]:
+    """Fetch 5m candles for every distinct coin in ``trades``.
+
+    Returns ``{coin: [candle, ...]}`` with the columns the reaction
+    signals need. The query uses ``.in_("coin", coins)`` so the whole
+    agent payload is one round-trip regardless of how many coins they
+    trade. The candle field carries ``coin`` so we can bucket client-side.
+
+    Lookback is capped at 15 days because B4 only cares about
+    spike-to-trade proximity within minutes; older candles are dead weight.
+    The limit is sized generously enough to hold ``coins_per_agent ×
+    candles_per_coin`` without tripping Supabase's default 1000-row cap
+    silently.
+    """
+    coins = sorted({t["coin"] for t in trades if t.get("coin")})
+    if not coins:
+        return {}
+    sb = get_client()
+    now_ms = int(time.time() * 1000)
+    since_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
+    # 288 candles/day × lookback × #coins, plus generous headroom so we
+    # never silently truncate. PostgREST hard-caps at 10000 by default;
+    # we ask for the full set.
+    max_rows = len(coins) * lookback_days * 300 + 1000
+    rows = (
+        sb.table(TABLE_CANDLES)
+        .select("coin,ts_ms,open,high,low,close,volume")
+        .in_("coin", coins)
+        .eq("interval", "5m")
+        .gte("ts_ms", since_ms)
+        .order("ts_ms")
+        .limit(max_rows)
+        .execute()
+        .data
+        or []
+    )
+    out: dict[str, list[dict]] = {}
+    for row in rows:
+        coin = row.get("coin")
+        if not coin:
+            continue
+        out.setdefault(coin, []).append(row)
+    return out
 
 
 def _load_owner_cluster(agent: dict) -> list[dict]:
@@ -94,7 +144,7 @@ def score_agent(agent: dict) -> dict | None:
     ctx = SignalContext(
         agent=agent,
         trades=trades,
-        candles={},
+        candles=_load_candles_for_trades(trades),
         onchain=None,  # populated in PR3
         now_ms=int(time.time() * 1000),
         owner_cluster=_load_owner_cluster(agent),

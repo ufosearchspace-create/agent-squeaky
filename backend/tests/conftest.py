@@ -93,6 +93,14 @@ _V1_STATES: dict[str, dict[str, float]] = {
     "B5_concurrent_open_positions": {
         "weak_human": -0.5, "neutral": 0.0, "medium_bot": 1.5, "strong_bot": 3.0,
     },
+    # Phase 3 reaction signals (PR2). Match migration 009_seed_b4_lrs.sql.
+    "B4_price_reaction_lag": {
+        "weak_human": -0.5, "neutral": 0.0, "weak_bot": 0.5,
+        "medium_bot": 1.5, "strong_bot": 3.0,
+    },
+    "B4b_pre_spike_entry_rate": {
+        "neutral": 0.0, "weak_bot": 0.5,
+    },
 }
 
 
