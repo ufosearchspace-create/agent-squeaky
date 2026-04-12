@@ -7,6 +7,20 @@ PROJECT-STATE.md
 **/.env
 **/.env.*
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
 
-#Ignore vscode AI rules
+# IDE / tooling
+.github/instructions/
+.playwright-mcp/
+.vscode/
+
+# Media (kept locally, not in repo)
+*.jpeg
+*.png
+*.docx
+
+# AI rules
 .github\instructions\codacy.instructions.md

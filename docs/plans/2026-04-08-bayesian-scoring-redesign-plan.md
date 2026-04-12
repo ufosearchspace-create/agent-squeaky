@@ -42,7 +42,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS scanner_trades_dgc_id_uk
   WHERE dgc_trade_id IS NOT NULL;
 ```
 
-**Step 2:** Apply via Supabase MCP `apply_migration` against project `zgoznvyeicbvqqoghmug` with name `phase0_trades_alter`.
+**Step 2:** Apply via Supabase MCP `apply_migration` against project `YOUR_SUPABASE_PROJECT_ID` with name `phase0_trades_alter`.
 
 **Step 3:** Verify with `list_tables` or direct query:
 
