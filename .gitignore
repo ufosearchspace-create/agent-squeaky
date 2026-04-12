@@ -6,3 +6,7 @@ node_modules/
 PROJECT-STATE.md
 **/.env
 **/.env.*
+
+
+#Ignore vscode AI rules
+.github\instructions\codacy.instructions.md

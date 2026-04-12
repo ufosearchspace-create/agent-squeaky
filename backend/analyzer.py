@@ -23,11 +23,12 @@ from db import get_client
 from scoring_engine import calibration
 from scoring_engine.base import SignalContext
 from scoring_engine.bayesian import PRIOR_LOG_ODDS_BITS, posterior
-from scoring_engine.classifier import classify
+from scoring_engine.classifier import classify, evaluate_human_assisted
 from scoring_engine.gates import apply_hard_gates
 from scoring_engine.signals.behavioral import ALL_BEHAVIORAL_SIGNALS
 from scoring_engine.signals.meta import ALL_META_SIGNALS
 from scoring_engine.signals.onchain import ALL_ONCHAIN_SIGNALS
+from scoring_engine.signals.psychology import ALL_PSYCHOLOGY_SIGNALS
 from scoring_engine.signals.reaction import ALL_REACTION_SIGNALS
 from scoring_engine.signals.structural import ALL_STRUCTURAL_SIGNALS
 from scoring_engine.signals.temporal import ALL_TEMPORAL_SIGNALS
@@ -37,6 +38,8 @@ logger = logging.getLogger(__name__)
 MIN_TRADES = 3
 
 # Order matters only for display and determinism in the evidence log.
+# Psychology signals go last so the evidence_log UI shows them grouped
+# under the mechanical signals that fed the posterior they evaluate.
 ALL_SIGNALS = (
     ALL_TEMPORAL_SIGNALS
     + ALL_STRUCTURAL_SIGNALS
@@ -44,6 +47,7 @@ ALL_SIGNALS = (
     + ALL_REACTION_SIGNALS
     + ALL_ONCHAIN_SIGNALS
     + ALL_META_SIGNALS
+    + ALL_PSYCHOLOGY_SIGNALS
 )
 
 
@@ -259,6 +263,17 @@ def score_agent(
         natural_class=natural,
     )
 
+    # HUMAN_ASSISTED runs after hard gates because it must see the
+    # complete gate_hit list — a manual label (HG1) suppresses the
+    # flag, while other gates coexist with it. Psychology signals are
+    # already in evidence_log by this point.
+    human_assisted, ha_triggered = evaluate_human_assisted(
+        p_bot=p_bot,
+        evidence_log=evidence_log,
+        trade_count=len(trades),
+        hard_gates_hit=gates_hit,
+    )
+
     row = {
         "agent_id": agent["id"],
         "scored_at": datetime.now(timezone.utc).isoformat(),
@@ -268,19 +283,22 @@ def score_agent(
         "evidence_log": evidence_log,
         "hard_gates_hit": gates_hit,
         "classification": final_class,
+        "human_assisted": human_assisted,
         "lr_version": calibration.current_version() or 1,
         "trade_count_at_scoring": len(trades),
         "flags": [],  # legacy text[] column still present in schema
     }
     sb.table(TABLE_SCORES).insert(row).execute()
     logger.info(
-        "Agent %s (%s): p=%.3f cls=%s gates=%s evidence=%d",
+        "Agent %s (%s): p=%.3f cls=%s gates=%s evidence=%d ha=%s%s",
         agent.get("id"),
         agent.get("name"),
         p_bot,
         final_class,
         gates_hit,
         len(evidence_log),
+        human_assisted,
+        f" ({','.join(ha_triggered)})" if human_assisted else "",
     )
     return row
 
