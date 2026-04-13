@@ -294,13 +294,20 @@ def run() -> None:
     upserted = upsert_agents(agents_raw)
     logger.info("Upserted %d agents", upserted)
 
-    # Load all agents from DB for trade/forum collection
+    # Only collect trades/forums for agents currently on the leaderboard.
+    # Stale agents (no longer in S3 leaderboard) stay in DB with their
+    # historical data but don't burn API quota every 30-min cycle.
+    leaderboard_ids = {str(a.get("id", "")) for a in agents_raw if a.get("id")}
     sb = get_client()
     db_agents = sb.table(TABLE_AGENTS).select("*").execute().data or []
+    active_agents = [a for a in db_agents if a["id"] in leaderboard_ids]
+    skipped = len(db_agents) - len(active_agents)
+    if skipped:
+        logger.info("Skipping %d inactive agents not on current leaderboard", skipped)
 
     # Step 2: Trades via DegenClaw API
     total_trades = 0
-    for agent in db_agents:
+    for agent in active_agents:
         try:
             n = collect_trades_for_agent(agent["id"])
             total_trades += n
@@ -312,7 +319,7 @@ def run() -> None:
 
     # Step 3: Forum posts
     total_posts = 0
-    for agent in db_agents:
+    for agent in active_agents:
         try:
             n = collect_forum_posts_for_agent(agent["id"])
             total_posts += n
@@ -320,4 +327,7 @@ def run() -> None:
             logger.exception("Forum collection failed for agent %s", agent["id"])
 
     elapsed = time.time() - start
-    logger.info("=== Collector done: %d agents, %d trades, %d posts in %.1fs ===", len(db_agents), total_trades, total_posts, elapsed)
+    logger.info(
+        "=== Collector done: %d/%d agents active, %d trades, %d posts in %.1fs ===",
+        len(active_agents), len(db_agents), total_trades, total_posts, elapsed,
+    )

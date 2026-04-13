@@ -195,8 +195,18 @@ def _fetch_candles(
 # DB helpers
 # ---------------------------------------------------------------------------
 
+def _is_hyperliquid_native(coin: str) -> bool:
+    """Return False for HIP-3 tokenized assets (xyz: prefix) which are
+    not available on Hyperliquid's candleSnapshot API."""
+    return not coin.startswith("xyz:")
+
+
 def _load_coin_counts(sb: Any, since_ms: int) -> list[dict]:
-    """Return [{'coin': str, 'n': int}] for trades with closed_at_ms >= since_ms."""
+    """Return [{'coin': str, 'n': int}] for trades with closed_at_ms >= since_ms.
+
+    Excludes HIP-3 tokenized assets (xyz: prefix) because Hyperliquid's
+    candleSnapshot API does not serve candles for those instruments.
+    """
     # supabase-py does not expose GROUP BY directly; we lean on the REST
     # rpc pattern via a select + client-side aggregation. For 11k trades
     # this is fine (single HTTP call, one pass).
@@ -211,7 +221,7 @@ def _load_coin_counts(sb: Any, since_ms: int) -> list[dict]:
     counts: dict[str, int] = {}
     for r in rows:
         coin = r.get("coin")
-        if not coin:
+        if not coin or not _is_hyperliquid_native(coin):
             continue
         counts[coin] = counts.get(coin, 0) + 1
     return [{"coin": k, "n": v} for k, v in counts.items()]
@@ -367,6 +377,7 @@ def run() -> None:
 __all__ = [
     "run",
     "_candle_to_row",
+    "_is_hyperliquid_native",
     "_select_coins_by_coverage",
     "_should_backfill",
     "_fetch_candles",

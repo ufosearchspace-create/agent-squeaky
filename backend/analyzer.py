@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 from config import (
     TABLE_AGENTS,
@@ -303,6 +304,49 @@ def score_agent(
     return row
 
 
+def _has_new_trades_since_last_score(sb: Any, agent_id: str) -> bool:
+    """Return True if the agent has trades newer than its latest score.
+
+    When there is no prior score, the agent is always eligible (first run).
+    This avoids wasting ~1.5 s per stale agent on trade-fetch + 34-signal
+    evaluation when nothing has changed.
+    """
+    last_score_rows = (
+        sb.table(TABLE_SCORES)
+        .select("scored_at")
+        .eq("agent_id", agent_id)
+        .order("scored_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not last_score_rows:
+        return True  # never scored → eligible
+
+    scored_at = last_score_rows[0].get("scored_at")
+    if not scored_at:
+        return True
+
+    # Check if any trade closed after the last scoring timestamp.
+    # scored_at is ISO-8601; convert to epoch ms for comparison.
+    try:
+        dt = datetime.fromisoformat(scored_at.replace("Z", "+00:00"))
+        scored_ms = int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return True
+
+    newer = (
+        sb.table(TABLE_TRADES)
+        .select("id", count="exact")
+        .eq("agent_id", agent_id)
+        .gt("closed_at_ms", scored_ms)
+        .limit(1)
+        .execute()
+    )
+    return (getattr(newer, "count", None) or 0) > 0
+
+
 def run() -> None:
     """Score all eligible agents. Called by APScheduler every 30 minutes."""
     logger.info("=== Analyzer started ===")
@@ -327,8 +371,12 @@ def run() -> None:
 
     agents = sb.table(TABLE_AGENTS).select("*").execute().data or []
     scored = 0
+    skipped_stale = 0
     for agent in agents:
         try:
+            if not _has_new_trades_since_last_score(sb, agent["id"]):
+                skipped_stale += 1
+                continue
             if score_agent(agent, all_candles=all_candles, all_onchain=all_onchain):
                 scored += 1
         except Exception:
@@ -336,8 +384,9 @@ def run() -> None:
 
     elapsed = time.time() - start
     logger.info(
-        "=== Analyzer done: %d/%d agents scored in %.1fs ===",
+        "=== Analyzer done: %d/%d scored, %d stale-skipped in %.1fs ===",
         scored,
         len(agents),
+        skipped_stale,
         elapsed,
     )
