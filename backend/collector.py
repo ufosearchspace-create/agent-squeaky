@@ -140,6 +140,7 @@ def upsert_agents(agents: list[dict]) -> int:
             "loss_count": perf.get("lossCount", 0),
             "total_pnl": float(perf.get("totalRealizedPnl", 0) or 0),
             "win_rate": float(perf.get("winRate", 0) or 0),
+            "is_active": True,  # presence on leaderboard ⇒ active this cycle
         }
         row = {k: v for k, v in row.items() if v is not None}
 
@@ -149,6 +150,36 @@ def upsert_agents(agents: list[dict]) -> int:
         except Exception:
             logger.exception("Failed to upsert agent %s", agent_id)
     return count
+
+
+def mark_inactive_agents(leaderboard_ids: set[str]) -> int:
+    """Flip is_active=False for agents missing from the current leaderboard.
+
+    Historical data stays in DB (trades, scores, onchain) — we only stop
+    re-fetching and re-scoring them every 30 min. Returns the count of
+    agents newly marked inactive.
+    """
+    if not leaderboard_ids:
+        # Paranoia: a zero-length leaderboard almost certainly means the
+        # API call failed. Bail out instead of nuking every active flag.
+        logger.warning("Leaderboard empty, skipping inactive-agent sweep")
+        return 0
+    sb = get_client()
+    try:
+        result = (
+            sb.table(TABLE_AGENTS)
+            .update({"is_active": False})
+            .not_.in_("id", list(leaderboard_ids))
+            .eq("is_active", True)
+            .execute()
+        )
+        changed = len(getattr(result, "data", []) or [])
+        if changed:
+            logger.info("Marked %d agents inactive (not on current leaderboard)", changed)
+        return changed
+    except Exception:
+        logger.exception("Failed to mark inactive agents")
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -294,16 +325,22 @@ def run() -> None:
     upserted = upsert_agents(agents_raw)
     logger.info("Upserted %d agents", upserted)
 
-    # Only collect trades/forums for agents currently on the leaderboard.
-    # Stale agents (no longer in S3 leaderboard) stay in DB with their
-    # historical data but don't burn API quota every 30-min cycle.
+    # Mark agents missing from this leaderboard as inactive. Collector/
+    # analyzer/frontend all filter on is_active so stale S1/S2 agents
+    # stop burning API calls and scoring cycles.
     leaderboard_ids = {str(a.get("id", "")) for a in agents_raw if a.get("id")}
+    mark_inactive_agents(leaderboard_ids)
+
+    # Load only active agents for trade/forum collection.
     sb = get_client()
-    db_agents = sb.table(TABLE_AGENTS).select("*").execute().data or []
-    active_agents = [a for a in db_agents if a["id"] in leaderboard_ids]
-    skipped = len(db_agents) - len(active_agents)
-    if skipped:
-        logger.info("Skipping %d inactive agents not on current leaderboard", skipped)
+    active_agents = (
+        sb.table(TABLE_AGENTS)
+        .select("*")
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
 
     # Step 2: Trades via DegenClaw API
     total_trades = 0
@@ -328,6 +365,6 @@ def run() -> None:
 
     elapsed = time.time() - start
     logger.info(
-        "=== Collector done: %d/%d agents active, %d trades, %d posts in %.1fs ===",
-        len(active_agents), len(db_agents), total_trades, total_posts, elapsed,
+        "=== Collector done: %d active agents, %d trades, %d posts in %.1fs ===",
+        len(active_agents), total_trades, total_posts, elapsed,
     )

@@ -369,7 +369,16 @@ def run() -> None:
         logger.exception("Failed to load onchain cache; M1/M2/M3/M6 will be skipped")
         all_onchain = {}
 
-    agents = sb.table(TABLE_AGENTS).select("*").execute().data or []
+    # Only score agents still on the current leaderboard. Stale S1/S2
+    # agents keep their last score in DB but don't get re-evaluated.
+    agents = (
+        sb.table(TABLE_AGENTS)
+        .select("*")
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
     scored = 0
     skipped_stale = 0
     for agent in agents:
@@ -384,7 +393,7 @@ def run() -> None:
 
     elapsed = time.time() - start
     logger.info(
-        "=== Analyzer done: %d/%d scored, %d stale-skipped in %.1fs ===",
+        "=== Analyzer done: %d/%d active scored, %d no-new-trades skipped in %.1fs ===",
         scored,
         len(agents),
         skipped_stale,
