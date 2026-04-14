@@ -304,6 +304,30 @@ def score_agent(
     return row
 
 
+#: Rolling S3 window. DegenClaw seasons are 7 days (Tuesday 8am SGT).
+#: Using a rolling window keeps this resilient across season cuts without
+#: a hard-coded start timestamp that would go stale every week.
+S3_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+
+
+def _has_trade_in_s3_window(sb: Any, agent_id: str, now_ms: int) -> bool:
+    """Return True if the agent has at least one trade in the rolling
+    7-day S3 window. Agents on the leaderboard who have not placed a
+    season trade yet are skipped to keep the public dashboard clean and
+    to avoid wasting scoring cycles on zero-signal inputs.
+    """
+    cutoff = now_ms - S3_WINDOW_MS
+    res = (
+        sb.table(TABLE_TRADES)
+        .select("id", count="exact")
+        .eq("agent_id", agent_id)
+        .gt("closed_at_ms", cutoff)
+        .limit(1)
+        .execute()
+    )
+    return (getattr(res, "count", None) or 0) > 0
+
+
 def _has_new_trades_since_last_score(sb: Any, agent_id: str) -> bool:
     """Return True if the agent has trades newer than its latest score.
 
@@ -381,8 +405,13 @@ def run() -> None:
     )
     scored = 0
     skipped_stale = 0
+    skipped_no_s3 = 0
+    now_ms = int(time.time() * 1000)
     for agent in agents:
         try:
+            if not _has_trade_in_s3_window(sb, agent["id"], now_ms):
+                skipped_no_s3 += 1
+                continue
             if not _has_new_trades_since_last_score(sb, agent["id"]):
                 skipped_stale += 1
                 continue
@@ -393,9 +422,10 @@ def run() -> None:
 
     elapsed = time.time() - start
     logger.info(
-        "=== Analyzer done: %d/%d active scored, %d no-new-trades skipped in %.1fs ===",
+        "=== Analyzer done: %d/%d active scored, %d no-S3, %d no-new-trades skipped in %.1fs ===",
         scored,
         len(agents),
+        skipped_no_s3,
         skipped_stale,
         elapsed,
     )
